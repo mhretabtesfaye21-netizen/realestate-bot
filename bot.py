@@ -133,6 +133,31 @@ async def require_access(update: Update) -> bool:
 # Basic commands
 # ---------------------------------------------------------------------------
 
+HELP_TEXT = (
+    "Here's what I can do:\n"
+    "/addclient - add a new client\n"
+    "/clients - list all clients\n"
+    "/find <keyword> - search by name or phone\n"
+    "/view <id> - see full client details\n"
+    "/note <id> <text> - add a note\n"
+    "/stage <id> <stage> - update pipeline stage (e.g. New, Contacted, Negotiating, Closed)\n"
+    "/followup <id> <days> <text> - schedule a follow-up\n"
+    "/today - today's follow-ups\n"
+    "/week - follow-ups in next 7 days\n"
+    "/overdue - missed follow-ups\n"
+    "/done <followup_id> - mark follow-up complete\n"
+    "/delete <id> - remove a client\n"
+    "/status - check your trial/subscription status\n"
+    "/help - show this list again anytime\n"
+)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
+    await update.message.reply_text(HELP_TEXT)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     agent = db.get_agent(user.id)
@@ -145,19 +170,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{owner_note}\n"
             f"Your Telegram ID is: {user.id}\n"
             f"You're on a free trial until {agent['trial_end']}.\n\n"
-            "Here's what I can do:\n"
-            "/addclient - add a new client\n"
-            "/clients - list all clients\n"
-            "/find <keyword> - search by name or phone\n"
-            "/view <id> - see full client details\n"
-            "/note <id> <text> - add a note\n"
-            "/followup <id> <days> <text> - schedule a follow-up\n"
-            "/today - today's follow-ups\n"
-            "/week - follow-ups in next 7 days\n"
-            "/overdue - missed follow-ups\n"
-            "/done <followup_id> - mark follow-up complete\n"
-            "/delete <id> - remove a client\n"
-            "/status - check your trial/subscription status\n"
+            f"{HELP_TEXT}"
         )
         return
 
@@ -176,6 +189,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clients - list all clients\n"
         "/addclient - add a new client\n"
         "/today - today's follow-ups\n"
+        "/help - see the full command list\n"
     )
 
 
@@ -339,6 +353,32 @@ async def client_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑️ Deleted client #{client_id} ({client['name']}).")
 
 
+async def client_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /stage <client_id> <stage>\n"
+            "Example: /stage 3 Negotiating\n"
+            "Common stages: New, Contacted, Negotiating, Closed, Lost — "
+            "but you can use any word you like."
+        )
+        return
+    try:
+        client_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Client id must be a number.")
+        return
+    agent_id = update.effective_user.id
+    client = db.get_client(client_id, agent_id)
+    if not client:
+        await update.message.reply_text("Client not found.")
+        return
+    stage = " ".join(context.args[1:])
+    db.set_stage(client_id, agent_id, stage)
+    await update.message.reply_text(f"📊 {client['name']} is now marked as: {stage}")
+
+
 # ---------------------------------------------------------------------------
 # Notes
 # ---------------------------------------------------------------------------
@@ -390,7 +430,7 @@ async def followup_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Client not found.")
         return
 
-    note = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+    note = " ".join(context.args[2:]) if len(context.args) > 2 else "Follow-up call"
     due_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
     db.add_followup(client_id, agent_id, due_date, note)
     await update.message.reply_text(
@@ -649,6 +689,8 @@ def main():
     application.add_handler(CommandHandler("find", clients_find))
     application.add_handler(CommandHandler("view", client_view))
     application.add_handler(CommandHandler("delete", client_delete))
+    application.add_handler(CommandHandler("stage", client_stage))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("note", note_add))
     application.add_handler(CommandHandler("followup", followup_add))
     application.add_handler(CommandHandler("today", followups_today))
