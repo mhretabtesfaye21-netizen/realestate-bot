@@ -1,9 +1,12 @@
 """
 bot.py
-A Telegram bot for real estate salespeople to manage clients and follow-ups.
+A Telegram bot for real estate agents to manage clients and follow-ups.
+Multi-agent (multi-tenant): every agent who messages this bot gets their
+own private, separate client list. New agents get a free trial; you (the
+owner) approve payment manually and extend their access with /approve.
 
-Commands:
-  /start              - welcome message and help
+Agent commands:
+  /start              - register / welcome
   /addclient          - add a new client (guided, step by step)
   /clients            - list all clients
   /find <keyword>     - search clients by name or phone
@@ -16,6 +19,11 @@ Commands:
   /done <followup_id> - mark a follow-up as completed
   /delete <id>        - delete a client permanently
   /cancel             - cancel the current guided step (e.g. /addclient)
+
+Owner-only commands (only work for OWNER_CHAT_ID):
+  /agents                    - list every agent and their subscription status
+  /approve <telegram_id> <days> - activate/extend an agent's subscription
+  /revoke <telegram_id>      - cut off an agent's access
 
 Setup:
   1. pip install -r requirements.txt
@@ -48,8 +56,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")  # where daily reminders are sent
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")  # you - gets daily reminders + admin powers
 REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "9"))  # 24h format, server time
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 
 # Conversation states for /addclient
 NAME, PHONE, INTEREST = range(3)
@@ -72,28 +81,76 @@ def fmt_followup_line(row):
     return f"• #{row['id']} {row['due_date']} — {row['client_name']} ({row['client_phone'] or 'no phone'}): {row['note'] or ''}"
 
 
+def is_owner(update: Update) -> bool:
+    return OWNER_CHAT_ID is not None and str(update.effective_user.id) == str(OWNER_CHAT_ID)
+
+
+async def require_access(update: Update) -> bool:
+    """Registers the agent if new, and checks they're allowed to use the bot.
+    Sends a message and returns False if access is denied."""
+    user = update.effective_user
+    agent = db.get_agent(user.id)
+    if agent is None:
+        agent = db.register_agent(user.id, user.full_name)
+        await update.message.reply_text(
+            f"👋 Welcome, {user.first_name}! You have a free {TRIAL_DAYS}-day trial, "
+            f"until {agent['trial_end']}.\n\nSend /addclient to add your first client."
+        )
+        return True
+
+    if not db.has_access(agent):
+        await update.message.reply_text(
+            "⏰ Your trial or subscription has ended.\n"
+            "Please contact the bot owner to renew your access."
+        )
+        return False
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Basic commands
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    user = update.effective_user
+    agent = db.get_agent(user.id)
+
+    if agent is None:
+        agent = db.register_agent(user.id, user.full_name)
+        await update.message.reply_text(
+            f"👋 Welcome to your Real Estate Client Assistant, {user.first_name}!\n\n"
+            f"Your Telegram ID is: {user.id}\n"
+            f"You're on a free trial until {agent['trial_end']}.\n\n"
+            "Here's what I can do:\n"
+            "/addclient - add a new client\n"
+            "/clients - list all clients\n"
+            "/find <keyword> - search by name or phone\n"
+            "/view <id> - see full client details\n"
+            "/note <id> <text> - add a note\n"
+            "/followup <id> <days> <text> - schedule a follow-up\n"
+            "/today - today's follow-ups\n"
+            "/week - follow-ups in next 7 days\n"
+            "/overdue - missed follow-ups\n"
+            "/done <followup_id> - mark follow-up complete\n"
+            "/delete <id> - remove a client\n"
+        )
+        return
+
+    status_line = (
+        f"Active until {agent['subscription_end']}"
+        if agent["status"] == "active"
+        else f"Trial until {agent['trial_end']}"
+        if agent["status"] == "trial"
+        else "Access revoked"
+    )
     await update.message.reply_text(
-        "👋 Welcome to your Real Estate Client Assistant!\n\n"
-        f"Your chat ID is: {chat_id}\n"
-        "(If you haven't already, put this in your .env as OWNER_CHAT_ID so daily reminders reach you.)\n\n"
-        "Here's what I can do:\n"
-        "/addclient - add a new client\n"
+        f"👋 Welcome back, {user.first_name}!\n"
+        f"Your Telegram ID is: {user.id}\n"
+        f"Status: {status_line}\n\n"
         "/clients - list all clients\n"
-        "/find <keyword> - search by name or phone\n"
-        "/view <id> - see full client details\n"
-        "/note <id> <text> - add a note\n"
-        "/followup <id> <days> <text> - schedule a follow-up\n"
+        "/addclient - add a new client\n"
         "/today - today's follow-ups\n"
-        "/week - follow-ups in next 7 days\n"
-        "/overdue - missed follow-ups\n"
-        "/done <followup_id> - mark follow-up complete\n"
-        "/delete <id> - remove a client\n"
     )
 
 
@@ -108,6 +165,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return ConversationHandler.END
     await update.message.reply_text("Let's add a new client. What's their name?")
     return NAME
 
@@ -130,8 +189,9 @@ async def addclient_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addclient_interest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     interest = "" if text == "-" else text
+    agent_id = update.effective_user.id
     client_id = db.add_client(
-        context.user_data["name"], context.user_data["phone"], interest
+        agent_id, context.user_data["name"], context.user_data["phone"], interest
     )
     await update.message.reply_text(
         f"✅ Client added as #{client_id}: {context.user_data['name']}\n\n"
@@ -146,7 +206,10 @@ async def addclient_interest(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------------------------------------------------------------------------
 
 async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.list_clients()
+    if not await require_access(update):
+        return
+    agent_id = update.effective_user.id
+    rows = db.list_clients(agent_id)
     if not rows:
         await update.message.reply_text("No clients yet. Add one with /addclient")
         return
@@ -155,11 +218,14 @@ async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clients_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /find <name or phone>")
         return
+    agent_id = update.effective_user.id
     keyword = " ".join(context.args)
-    rows = db.search_clients(keyword)
+    rows = db.search_clients(agent_id, keyword)
     if not rows:
         await update.message.reply_text("No matches found.")
         return
@@ -168,6 +234,8 @@ async def clients_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /view <client_id>")
         return
@@ -177,14 +245,15 @@ async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Client id must be a number.")
         return
 
-    client = db.get_client(client_id)
+    agent_id = update.effective_user.id
+    client = db.get_client(client_id, agent_id)
     if not client:
         await update.message.reply_text("Client not found.")
         return
 
     msg = fmt_client(client) + "\n\n"
 
-    followups = db.get_followups_for_client(client_id)
+    followups = db.get_followups_for_client(client_id, agent_id)
     if followups:
         msg += "📅 Upcoming follow-ups:\n"
         msg += "\n".join(f"  #{f['id']} {f['due_date']} — {f['note'] or ''}" for f in followups)
@@ -192,7 +261,7 @@ async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "📅 No upcoming follow-ups.\n\n"
 
-    notes = db.get_notes(client_id)
+    notes = db.get_notes(client_id, agent_id)
     if notes:
         msg += "📝 Notes (latest first):\n"
         msg += "\n".join(f"  [{n['created_at'][:16]}] {n['text']}" for n in notes[:10])
@@ -203,6 +272,8 @@ async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def client_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /delete <client_id>")
         return
@@ -211,11 +282,12 @@ async def client_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Client id must be a number.")
         return
-    client = db.get_client(client_id)
+    agent_id = update.effective_user.id
+    client = db.get_client(client_id, agent_id)
     if not client:
         await update.message.reply_text("Client not found.")
         return
-    db.delete_client(client_id)
+    db.delete_client(client_id, agent_id)
     await update.message.reply_text(f"🗑️ Deleted client #{client_id} ({client['name']}).")
 
 
@@ -224,6 +296,8 @@ async def client_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def note_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /note <client_id> <text>")
         return
@@ -232,12 +306,13 @@ async def note_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Client id must be a number.")
         return
-    client = db.get_client(client_id)
+    agent_id = update.effective_user.id
+    client = db.get_client(client_id, agent_id)
     if not client:
         await update.message.reply_text("Client not found.")
         return
     text = " ".join(context.args[1:])
-    db.add_note(client_id, text)
+    db.add_note(client_id, agent_id, text)
     await update.message.reply_text(f"📝 Note added to {client['name']}.")
 
 
@@ -246,6 +321,8 @@ async def note_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def followup_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if len(context.args) < 2:
         await update.message.reply_text(
             "Usage: /followup <client_id> <days_from_now> <note>\n"
@@ -259,22 +336,26 @@ async def followup_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Client id and days must be numbers.")
         return
 
-    client = db.get_client(client_id)
+    agent_id = update.effective_user.id
+    client = db.get_client(client_id, agent_id)
     if not client:
         await update.message.reply_text("Client not found.")
         return
 
     note = " ".join(context.args[2:]) if len(context.args) > 2 else ""
     due_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    db.add_followup(client_id, due_date, note)
+    db.add_followup(client_id, agent_id, due_date, note)
     await update.message.reply_text(
         f"📅 Follow-up scheduled for {client['name']} on {due_date}."
     )
 
 
 async def followups_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
+    agent_id = update.effective_user.id
     today_str = datetime.now().strftime("%Y-%m-%d")
-    rows = db.get_followups_due_on(today_str)
+    rows = db.get_followups_due_on(agent_id, today_str)
     if not rows:
         await update.message.reply_text("✅ No follow-ups due today.")
         return
@@ -283,9 +364,14 @@ async def followups_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def followups_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
+    agent_id = update.effective_user.id
     today = datetime.now()
     end = today + timedelta(days=7)
-    rows = db.get_followups_between(today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    rows = db.get_followups_between(
+        agent_id, today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    )
     if not rows:
         await update.message.reply_text("No follow-ups in the next 7 days.")
         return
@@ -294,8 +380,11 @@ async def followups_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def followups_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
+    agent_id = update.effective_user.id
     today_str = datetime.now().strftime("%Y-%m-%d")
-    rows = db.get_overdue_followups(today_str)
+    rows = db.get_overdue_followups(agent_id, today_str)
     if not rows:
         await update.message.reply_text("🎉 Nothing overdue.")
         return
@@ -304,6 +393,8 @@ async def followups_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def followup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /done <followup_id>")
         return
@@ -312,11 +403,12 @@ async def followup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Follow-up id must be a number.")
         return
-    followup = db.get_followup(followup_id)
+    agent_id = update.effective_user.id
+    followup = db.get_followup(followup_id, agent_id)
     if not followup:
         await update.message.reply_text("Follow-up not found.")
         return
-    db.mark_followup_done(followup_id)
+    db.mark_followup_done(followup_id, agent_id)
     await update.message.reply_text(
         f"✅ Marked follow-up #{followup_id} as done.\n"
         f"Tip: schedule the next one with /followup {followup['client_id']} <days> <note>"
@@ -324,28 +416,97 @@ async def followup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Daily reminder job
+# Owner-only: manage agents / subscriptions
+# ---------------------------------------------------------------------------
+
+async def agents_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("This command is owner-only.")
+        return
+    rows = db.list_agents()
+    if not rows:
+        await update.message.reply_text("No agents registered yet.")
+        return
+    lines = []
+    for r in rows:
+        status = r["status"]
+        detail = r["subscription_end"] if status == "active" else r["trial_end"]
+        lines.append(f"• {r['telegram_id']} — {r['name']} — {status} (until {detail})")
+    await update.message.reply_text("👥 Agents:\n" + "\n".join(lines))
+
+
+async def agent_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("This command is owner-only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /approve <telegram_id> <days>")
+        return
+    try:
+        telegram_id = int(context.args[0])
+        days = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("telegram_id and days must be numbers.")
+        return
+    agent = db.get_agent(telegram_id)
+    if not agent:
+        await update.message.reply_text("No agent with that Telegram ID has messaged the bot yet.")
+        return
+    db.approve_agent(telegram_id, days)
+    await update.message.reply_text(f"✅ Approved agent {telegram_id} for {days} days.")
+    try:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=f"🎉 Your subscription is now active for {days} days. Thanks for subscribing!",
+        )
+    except Exception:
+        logger.warning("Could not notify agent %s of approval", telegram_id)
+
+
+async def agent_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("This command is owner-only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /revoke <telegram_id>")
+        return
+    try:
+        telegram_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("telegram_id must be a number.")
+        return
+    db.revoke_agent(telegram_id)
+    await update.message.reply_text(f"🚫 Revoked access for agent {telegram_id}.")
+
+
+# ---------------------------------------------------------------------------
+# Daily reminder job (runs once per day, messages every agent with due items)
 # ---------------------------------------------------------------------------
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
-    if not OWNER_CHAT_ID:
-        logger.warning("OWNER_CHAT_ID not set - skipping daily reminder.")
-        return
-
     today_str = datetime.now().strftime("%Y-%m-%d")
-    due_today = db.get_followups_due_on(today_str)
-    overdue = db.get_overdue_followups(today_str)
 
-    if not due_today and not overdue:
-        return  # nothing to say, don't spam
+    for agent_id in db.all_active_agent_ids():
+        agent = db.get_agent(agent_id)
+        if not db.has_access(agent):
+            continue
 
-    msg = "☀️ Good morning! Here's your follow-up list:\n\n"
-    if due_today:
-        msg += "📅 Due today:\n" + "\n".join(fmt_followup_line(r) for r in due_today) + "\n\n"
-    if overdue:
-        msg += "⚠️ Overdue:\n" + "\n".join(fmt_followup_line(r) for r in overdue)
+        due_today = db.get_followups_due_on(agent_id, today_str)
+        overdue = db.get_overdue_followups(agent_id, today_str)
 
-    await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
+        if not due_today and not overdue:
+            continue
+
+        msg = "☀️ Good morning! Here's your follow-up list:\n\n"
+        if due_today:
+            msg += "📅 Due today:\n" + "\n".join(fmt_followup_line(r) for r in due_today) + "\n\n"
+        if overdue:
+            msg += "⚠️ Overdue:\n" + "\n".join(fmt_followup_line(r) for r in overdue)
+
+        try:
+            await context.bot.send_message(chat_id=agent_id, text=msg)
+        except Exception:
+            logger.warning("Could not send daily reminder to agent %s", agent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +546,11 @@ def main():
     application.add_handler(CommandHandler("week", followups_week))
     application.add_handler(CommandHandler("overdue", followups_overdue))
     application.add_handler(CommandHandler("done", followup_done))
+
+    # Owner-only
+    application.add_handler(CommandHandler("agents", agents_list))
+    application.add_handler(CommandHandler("approve", agent_approve))
+    application.add_handler(CommandHandler("revoke", agent_revoke))
 
     # Daily reminder job (requires: pip install "python-telegram-bot[job-queue]")
     if application.job_queue:
