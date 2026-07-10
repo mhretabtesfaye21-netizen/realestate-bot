@@ -18,12 +18,14 @@ Agent commands:
   /overdue            - show follow-ups that were missed
   /done <followup_id> - mark a follow-up as completed
   /delete <id>        - delete a client permanently
+  /status             - check your own trial/subscription status
   /cancel             - cancel the current guided step (e.g. /addclient)
 
 Owner-only commands (only work for OWNER_CHAT_ID):
   /agents                    - list every agent and their subscription status
   /approve <telegram_id> <days> - activate/extend an agent's subscription
   /revoke <telegram_id>      - cut off an agent's access
+  /backup                    - download the current database file
 
 Setup:
   1. pip install -r requirements.txt
@@ -58,6 +60,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")  # you - gets daily reminders + admin powers
 REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "9"))  # 24h format, server time
+BANK_INFO = os.environ.get("BANK_INFO", "")        # e.g. "CBE 1000123456789, Tizita Dachew"
+TELEBIRR_NUMBER = os.environ.get("TELEBIRR_NUMBER", "")  # e.g. "0911223344"
+MONTHLY_PRICE = os.environ.get("MONTHLY_PRICE", "")       # e.g. "300 birr"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 
 # Conversation states for /addclient
@@ -85,6 +90,23 @@ def is_owner(update: Update) -> bool:
     return OWNER_CHAT_ID is not None and str(update.effective_user.id) == str(OWNER_CHAT_ID)
 
 
+def payment_instructions() -> str:
+    lines = []
+    if MONTHLY_PRICE:
+        lines.append(f"💳 Price: {MONTHLY_PRICE}/month")
+    if BANK_INFO:
+        lines.append(f"🏦 Bank: {BANK_INFO}")
+    if TELEBIRR_NUMBER:
+        lines.append(f"📱 Telebirr: {TELEBIRR_NUMBER}")
+    if not lines:
+        return "\n\nPlease contact the bot owner for payment details."
+    return (
+        "\n\n"
+        + "\n".join(lines)
+        + "\n\nAfter paying, send your Telegram ID (shown in /status) to the owner so they can activate your account."
+    )
+
+
 async def require_access(update: Update) -> bool:
     """Registers the agent if new, and checks they're allowed to use the bot.
     Sends a message and returns False if access is denied."""
@@ -100,8 +122,7 @@ async def require_access(update: Update) -> bool:
 
     if not db.has_access(agent):
         await update.message.reply_text(
-            "⏰ Your trial or subscription has ended.\n"
-            "Please contact the bot owner to renew your access."
+            "⏰ Your trial or subscription has ended." + payment_instructions()
         )
         return False
 
@@ -136,6 +157,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/overdue - missed follow-ups\n"
             "/done <followup_id> - mark follow-up complete\n"
             "/delete <id> - remove a client\n"
+            "/status - check your trial/subscription status\n"
+            "/status - check your trial/subscription status\n"
         )
         return
 
@@ -161,6 +184,29 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
+
+
+async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    agent = db.get_agent(user.id)
+    if agent is None:
+        await update.message.reply_text("You haven't registered yet — send /start first.")
+        return
+
+    if agent["status"] == "active":
+        msg = f"✅ Your subscription is active until {agent['subscription_end']}."
+    elif agent["status"] == "trial":
+        days_left = (
+            datetime.strptime(agent["trial_end"], "%Y-%m-%d") - datetime.now()
+        ).days
+        if db.has_access(agent):
+            msg = f"🕐 You're on a free trial until {agent['trial_end']} ({max(days_left, 0)} day(s) left)."
+        else:
+            msg = f"⏰ Your free trial ended on {agent['trial_end']}.\n\n{PAYMENT_INFO}"
+    else:
+        msg = f"🚫 Your access has been revoked.\n\n{PAYMENT_INFO}"
+
+    await update.message.reply_text(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +529,65 @@ async def agent_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🚫 Revoked access for agent {telegram_id}.")
 
 
+async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lets any agent check their own trial/subscription status."""
+    user = update.effective_user
+    agent = db.get_agent(user.id)
+    if agent is None:
+        agent = db.register_agent(user.id, user.full_name)
+        await update.message.reply_text(
+            f"You're brand new here! Free trial until {agent['trial_end']}.\n"
+            f"Your Telegram ID: {user.id}"
+        )
+        return
+
+    if agent["status"] == "active":
+        msg = f"✅ Active subscription until {agent['subscription_end']}."
+    elif agent["status"] == "trial" and db.has_access(agent):
+        msg = f"🕐 Free trial — {agent['trial_end']} is your last day."
+    elif agent["status"] == "trial":
+        msg = f"⏰ Your trial ended on {agent['trial_end']}." + payment_instructions()
+    else:
+        msg = "🚫 Your access has been revoked." + payment_instructions()
+
+    await update.message.reply_text(f"Your Telegram ID: {user.id}\n\n{msg}")
+
+
+async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: sends the current database file as a downloadable backup."""
+    if not is_owner(update):
+        await update.message.reply_text("This command is owner-only.")
+        return
+    if not os.path.exists(db.DB_PATH):
+        await update.message.reply_text("No database file found yet.")
+        return
+    try:
+        with open(db.DB_PATH, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"clients_backup_{datetime.now().strftime('%Y-%m-%d')}.db",
+                caption="📦 Here's your current backup. Keep it somewhere safe.",
+            )
+    except Exception as e:
+        logger.warning("Backup failed: %s", e)
+        await update.message.reply_text("Something went wrong sending the backup.")
+
+
+async def backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("This command is owner-only.")
+        return
+    if not os.path.exists(db.DB_PATH):
+        await update.message.reply_text("No database file found yet.")
+        return
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    await update.message.reply_document(
+        document=open(db.DB_PATH, "rb"),
+        filename=f"clients_backup_{stamp}.db",
+        caption="📦 Here's your current backup. Save it somewhere safe.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Daily reminder job (runs once per day, messages every agent with due items)
 # ---------------------------------------------------------------------------
@@ -539,6 +644,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", my_status))
     application.add_handler(addclient_conv)
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("find", clients_find))
@@ -555,6 +661,11 @@ def main():
     application.add_handler(CommandHandler("agents", agents_list))
     application.add_handler(CommandHandler("approve", agent_approve))
     application.add_handler(CommandHandler("revoke", agent_revoke))
+    application.add_handler(CommandHandler("backup", send_backup))
+
+    # Any agent can check their own status
+    application.add_handler(CommandHandler("status", my_status))
+    application.add_handler(CommandHandler("backup", backup_now))
 
     # Daily reminder job (requires: pip install "python-telegram-bot[job-queue]")
     if application.job_queue:
