@@ -115,11 +115,13 @@ async def require_access(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     agent = db.get_agent(user.id)
+    owner_note = "\n👑 You are the Owner — you also have /agents, /approve, /revoke\n" if is_owner(update) else ""
 
     if agent is None:
         agent = db.register_agent(user.id, user.full_name)
         await update.message.reply_text(
-            f"👋 Welcome to your Real Estate Client Assistant, {user.first_name}!\n\n"
+            f"👋 Welcome to your Real Estate Client Assistant, {user.first_name}!\n"
+            f"{owner_note}\n"
             f"Your Telegram ID is: {user.id}\n"
             f"You're on a free trial until {agent['trial_end']}.\n\n"
             "Here's what I can do:\n"
@@ -146,6 +148,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         f"👋 Welcome back, {user.first_name}!\n"
+        f"{owner_note}"
         f"Your Telegram ID is: {user.id}\n"
         f"Status: {status_line}\n\n"
         "/clients - list all clients\n"
@@ -431,7 +434,8 @@ async def agents_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         status = r["status"]
         detail = r["subscription_end"] if status == "active" else r["trial_end"]
-        lines.append(f"• {r['telegram_id']} — {r['name']} — {status} (until {detail})")
+        owner_tag = " 👑 (you, the owner)" if str(r["telegram_id"]) == str(OWNER_CHAT_ID) else ""
+        lines.append(f"• {r['telegram_id']} — {r['name']} — {status} (until {detail}){owner_tag}")
     await update.message.reply_text("👥 Agents:\n" + "\n".join(lines))
 
 
