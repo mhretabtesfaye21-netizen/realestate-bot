@@ -158,7 +158,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/done <followup_id> - mark follow-up complete\n"
             "/delete <id> - remove a client\n"
             "/status - check your trial/subscription status\n"
-            "/status - check your trial/subscription status\n"
         )
         return
 
