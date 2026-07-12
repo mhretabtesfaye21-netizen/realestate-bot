@@ -31,10 +31,18 @@ import logging
 from datetime import datetime, timedelta, time as dtime
 
 from dotenv import load_dotenv
-from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+from telegram import (
+    Update,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     MessageHandler,
@@ -204,12 +212,17 @@ async def register_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if OWNER_CHAT_ID:
         try:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve 30 days", callback_data=f"approve:{user.id}:30"),
+                    InlineKeyboardButton("✅ Approve 90 days", callback_data=f"approve:{user.id}:90"),
+                ],
+                [InlineKeyboardButton("❌ Reject", callback_data=f"reject:{user.id}")],
+            ])
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=(
-                    f"🆕 New agency wants approval: '{name}' (Telegram ID: {user.id})\n"
-                    f"To approve: /approve_agency {user.id} 30"
-                ),
+                text=f"🆕 New agency wants approval: '{name}' (Telegram ID: {user.id})",
+                reply_markup=keyboard,
             )
         except Exception:
             logger.warning("Could not notify owner of new agency signup.")
@@ -596,10 +609,17 @@ async def owner_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No agencies waiting for approval.")
         return
-    lines = [f"• {r['telegram_id']} — {r['name']}" for r in rows]
-    await update.message.reply_text(
-        "⏳ Pending agencies:\n" + "\n".join(lines) + "\n\nApprove with /approve_agency <id> <days>"
-    )
+    for r in rows:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve 30 days", callback_data=f"approve:{r['telegram_id']}:30"),
+                InlineKeyboardButton("✅ Approve 90 days", callback_data=f"approve:{r['telegram_id']}:90"),
+            ],
+            [InlineKeyboardButton("❌ Reject", callback_data=f"reject:{r['telegram_id']}")],
+        ])
+        await update.message.reply_text(
+            f"⏳ {r['name']} (ID: {r['telegram_id']})", reply_markup=keyboard
+        )
 
 
 async def owner_agencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -665,6 +685,55 @@ async def owner_revoke_agency(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(
         f"🚫 Revoked agency {telegram_id}. All their workers are now locked out too."
     )
+
+
+async def owner_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the Approve/Reject inline buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    if not OWNER_CHAT_ID or str(query.from_user.id) != str(OWNER_CHAT_ID):
+        await query.edit_message_text("This action is owner-only.")
+        return
+
+    parts = query.data.split(":")
+    action = parts[0]
+
+    if action == "approve":
+        telegram_id, days = int(parts[1]), int(parts[2])
+        agency = db.get_agency(telegram_id)
+        if not agency:
+            await query.edit_message_text("That agency no longer exists.")
+            return
+        db.approve_agency(telegram_id, days)
+        await query.edit_message_text(f"✅ Approved '{agency['name']}' for {days} days.")
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    f"🎉 Your agency is now active for {days} days!\n"
+                    f"Your join code for workers: {agency['join_code']}\n"
+                    "Share /join <code> with your sales team."
+                ),
+            )
+        except Exception:
+            logger.warning("Could not notify agency %s of approval", telegram_id)
+
+    elif action == "reject":
+        telegram_id = int(parts[1])
+        agency = db.get_agency(telegram_id)
+        if not agency:
+            await query.edit_message_text("That agency no longer exists.")
+            return
+        db.revoke_agency(telegram_id)
+        await query.edit_message_text(f"❌ Rejected '{agency['name']}'.")
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text="Your agency registration was not approved. Contact the owner for details.",
+            )
+        except Exception:
+            logger.warning("Could not notify agency %s of rejection", telegram_id)
 
 
 async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -805,6 +874,7 @@ def main():
     application.add_handler(CommandHandler("approve_agency", owner_approve_agency))
     application.add_handler(CommandHandler("revoke_agency", owner_revoke_agency))
     application.add_handler(CommandHandler("backup", send_backup))
+    application.add_handler(CallbackQueryHandler(owner_button_tap))
 
     if application.job_queue:
         application.job_queue.run_daily(
