@@ -1,20 +1,23 @@
 """
-db.py
-Handles all database operations for the Real Estate Follow-Up Bot.
-Uses SQLite (a single local file, no server needed).
+db.py — Stage 1: Agencies, Workers, and Clients
 
-Multi-agent support: every client/note/followup belongs to a specific
-"agent" (identified by their Telegram user ID). Agents never see each
-other's data. Each agent also has a subscription status (trial/active/
-revoked) used to control access.
+Three roles:
+  - OWNER: you. Controls everything via .env OWNER_CHAT_ID. Approves/revokes agencies.
+  - AGENCY: a real estate company. Must be approved by the owner before anyone
+    under it can use the bot. Has a join_code that workers use to join.
+  - WORKER: a salesperson who belongs to one agency. Manages their own clients.
+    A worker's access depends entirely on their agency being active.
+
+No free trial anymore — access is owner-approved only.
 """
 
 import os
 import sqlite3
+import random
+import string
 from datetime import datetime, timedelta
 
 DB_PATH = os.environ.get("DB_PATH", "clients.db")
-TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 
 
 def get_connection():
@@ -28,24 +31,36 @@ def init_db():
     cur = conn.cursor()
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS agents (
+        CREATE TABLE IF NOT EXISTS agencies (
             telegram_id INTEGER PRIMARY KEY,
-            name TEXT,
-            status TEXT DEFAULT 'trial',       -- trial | active | revoked
-            trial_end TEXT,
+            name TEXT NOT NULL,
+            language TEXT DEFAULT 'en',
+            status TEXT DEFAULT 'pending',   -- pending | active | revoked
             subscription_end TEXT,
+            join_code TEXT UNIQUE,
             created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS workers (
+            telegram_id INTEGER PRIMARY KEY,
+            agency_id INTEGER NOT NULL,
+            name TEXT,
+            created_at TEXT,
+            FOREIGN KEY (agency_id) REFERENCES agencies (telegram_id)
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
+            agency_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             phone TEXT,
             interest TEXT,
-            stage TEXT DEFAULT 'New',
+            status TEXT DEFAULT 'red',   -- red | yellow | green
             created_at TEXT
         )
     """)
@@ -54,10 +69,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_id INTEGER NOT NULL,
-            agent_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
             text TEXT NOT NULL,
-            created_at TEXT,
-            FOREIGN KEY (client_id) REFERENCES clients (id)
+            created_at TEXT
         )
     """)
 
@@ -65,12 +79,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS followups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_id INTEGER NOT NULL,
-            agent_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
             due_date TEXT NOT NULL,
             note TEXT,
             done INTEGER DEFAULT 0,
-            created_at TEXT,
-            FOREIGN KEY (client_id) REFERENCES clients (id)
+            created_at TEXT
         )
     """)
 
@@ -78,84 +91,164 @@ def init_db():
     conn.close()
 
 
-# ---------- AGENTS (subscribers who use the bot) ----------
+# ---------- AGENCIES ----------
 
-def get_agent(telegram_id):
+def _generate_join_code(cur):
+    while True:
+        code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        cur.execute("SELECT 1 FROM agencies WHERE join_code = ?", (code,))
+        if not cur.fetchone():
+            return code
+
+
+def register_agency(telegram_id, name):
+    existing = get_agency(telegram_id)
+    if existing:
+        return existing
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM agents WHERE telegram_id = ?", (telegram_id,))
+    code = _generate_join_code(cur)
+    cur.execute(
+        "INSERT INTO agencies (telegram_id, name, status, join_code, created_at) "
+        "VALUES (?, ?, 'pending', ?, ?)",
+        (telegram_id, name, code, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return get_agency(telegram_id)
+
+
+def get_agency(telegram_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM agencies WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def register_agent(telegram_id, name):
-    """Creates a new agent with a free trial. Returns the agent row."""
-    existing = get_agent(telegram_id)
-    if existing:
-        return existing
-    trial_end = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+def get_agency_by_join_code(code):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO agents (telegram_id, name, status, trial_end, created_at) VALUES (?, ?, 'trial', ?, ?)",
-        (telegram_id, name, trial_end, datetime.now().isoformat()),
-    )
-    conn.commit()
+    cur.execute("SELECT * FROM agencies WHERE join_code = ?", (code.upper(),))
+    row = cur.fetchone()
     conn.close()
-    return get_agent(telegram_id)
+    return row
 
 
-def list_agents():
+def list_agencies():
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM agents ORDER BY created_at DESC")
+    cur.execute("SELECT * FROM agencies ORDER BY created_at DESC")
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def approve_agent(telegram_id, days):
-    """Activates or extends an agent's subscription by `days` from today."""
+def list_pending_agencies():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM agencies WHERE status = 'pending' ORDER BY created_at ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def approve_agency(telegram_id, days):
     sub_end = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE agents SET status = 'active', subscription_end = ? WHERE telegram_id = ?",
+        "UPDATE agencies SET status = 'active', subscription_end = ? WHERE telegram_id = ?",
         (sub_end, telegram_id),
     )
     conn.commit()
     conn.close()
 
 
-def revoke_agent(telegram_id):
+def revoke_agency(telegram_id):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE agents SET status = 'revoked' WHERE telegram_id = ?", (telegram_id,))
+    cur.execute("UPDATE agencies SET status = 'revoked' WHERE telegram_id = ?", (telegram_id,))
     conn.commit()
     conn.close()
 
 
-def has_access(agent_row):
-    """True if this agent is allowed to use the bot right now."""
-    if agent_row is None:
-        return False
-    today = datetime.now().strftime("%Y-%m-%d")
-    if agent_row["status"] == "active":
-        return agent_row["subscription_end"] is None or agent_row["subscription_end"] >= today
-    if agent_row["status"] == "trial":
-        return agent_row["trial_end"] >= today
-    return False
-
-
-# ---------- CLIENTS (scoped to one agent) ----------
-
-def add_client(agent_id, name, phone, interest):
+def set_agency_language(telegram_id, language):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO clients (agent_id, name, phone, interest, created_at) VALUES (?, ?, ?, ?, ?)",
-        (agent_id, name, phone, interest, datetime.now().isoformat()),
+        "UPDATE agencies SET language = ? WHERE telegram_id = ?", (language, telegram_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def agency_has_access(agency_row):
+    if agency_row is None:
+        return False
+    if agency_row["status"] != "active":
+        return False
+    if agency_row["subscription_end"] is None:
+        return True
+    today = datetime.now().strftime("%Y-%m-%d")
+    return agency_row["subscription_end"] >= today
+
+
+# ---------- WORKERS ----------
+
+def register_worker(telegram_id, agency_id, name):
+    existing = get_worker(telegram_id)
+    if existing:
+        return existing
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO workers (telegram_id, agency_id, name, created_at) VALUES (?, ?, ?, ?)",
+        (telegram_id, agency_id, name, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return get_worker(telegram_id)
+
+
+def get_worker(telegram_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def list_workers_for_agency(agency_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM workers WHERE agency_id = ? ORDER BY created_at DESC", (agency_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def worker_has_access(worker_row):
+    """A worker's access depends entirely on their agency being active."""
+    if worker_row is None:
+        return False
+    agency = get_agency(worker_row["agency_id"])
+    return agency_has_access(agency)
+
+
+# ---------- CLIENTS (scoped to one worker) ----------
+
+def add_client(worker_id, agency_id, name, phone, interest):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO clients (worker_id, agency_id, name, phone, interest, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (worker_id, agency_id, name, phone, interest, datetime.now().isoformat()),
     )
     conn.commit()
     client_id = cur.lastrowid
@@ -163,83 +256,85 @@ def add_client(agent_id, name, phone, interest):
     return client_id
 
 
-def get_client(client_id, agent_id):
-    """Returns the client only if it belongs to this agent (prevents one
-    agent from viewing/editing another agent's client by guessing an id)."""
+def get_client(client_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM clients WHERE id = ? AND agent_id = ?", (client_id, agent_id))
+    cur.execute(
+        "SELECT * FROM clients WHERE id = ? AND worker_id = ?", (client_id, worker_id)
+    )
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def list_clients(agent_id):
+def list_clients(worker_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM clients WHERE agent_id = ? ORDER BY created_at DESC", (agent_id,)
+        "SELECT * FROM clients WHERE worker_id = ? ORDER BY created_at DESC", (worker_id,)
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def search_clients(agent_id, keyword):
+def search_clients(worker_id, keyword):
     conn = get_connection()
     cur = conn.cursor()
     like = f"%{keyword}%"
     cur.execute(
-        "SELECT * FROM clients WHERE agent_id = ? AND (name LIKE ? OR phone LIKE ?) ORDER BY created_at DESC",
-        (agent_id, like, like),
+        "SELECT * FROM clients WHERE worker_id = ? AND (name LIKE ? OR phone LIKE ?) "
+        "ORDER BY created_at DESC",
+        (worker_id, like, like),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def set_stage(client_id, agent_id, stage):
+def set_client_status(client_id, worker_id, status):
+    """status must be 'red', 'yellow', or 'green'."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE clients SET stage = ? WHERE id = ? AND agent_id = ?",
-        (stage, client_id, agent_id),
+        "UPDATE clients SET status = ? WHERE id = ? AND worker_id = ?",
+        (status, client_id, worker_id),
     )
     conn.commit()
     conn.close()
 
 
-def delete_client(client_id, agent_id):
+def delete_client(client_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM notes WHERE client_id = ? AND agent_id = ?", (client_id, agent_id))
+    cur.execute("DELETE FROM notes WHERE client_id = ? AND worker_id = ?", (client_id, worker_id))
     cur.execute(
-        "DELETE FROM followups WHERE client_id = ? AND agent_id = ?", (client_id, agent_id)
+        "DELETE FROM followups WHERE client_id = ? AND worker_id = ?", (client_id, worker_id)
     )
-    cur.execute("DELETE FROM clients WHERE id = ? AND agent_id = ?", (client_id, agent_id))
+    cur.execute("DELETE FROM clients WHERE id = ? AND worker_id = ?", (client_id, worker_id))
     conn.commit()
     conn.close()
 
 
 # ---------- NOTES ----------
 
-def add_note(client_id, agent_id, text):
+def add_note(client_id, worker_id, text):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO notes (client_id, agent_id, text, created_at) VALUES (?, ?, ?, ?)",
-        (client_id, agent_id, text, datetime.now().isoformat()),
+        "INSERT INTO notes (client_id, worker_id, text, created_at) VALUES (?, ?, ?, ?)",
+        (client_id, worker_id, text, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
 
 
-def get_notes(client_id, agent_id):
+def get_notes(client_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM notes WHERE client_id = ? AND agent_id = ? ORDER BY created_at DESC",
-        (client_id, agent_id),
+        "SELECT * FROM notes WHERE client_id = ? AND worker_id = ? ORDER BY created_at DESC",
+        (client_id, worker_id),
     )
     rows = cur.fetchall()
     conn.close()
@@ -248,103 +343,110 @@ def get_notes(client_id, agent_id):
 
 # ---------- FOLLOW-UPS ----------
 
-def add_followup(client_id, agent_id, due_date, note=""):
+def add_followup(client_id, worker_id, due_date, note=""):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO followups (client_id, agent_id, due_date, note, created_at) VALUES (?, ?, ?, ?, ?)",
-        (client_id, agent_id, due_date, note, datetime.now().isoformat()),
+        "INSERT INTO followups (client_id, worker_id, due_date, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (client_id, worker_id, due_date, note, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
 
 
-def get_followups_for_client(client_id, agent_id):
+def get_followups_for_client(client_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM followups WHERE client_id = ? AND agent_id = ? AND done = 0 ORDER BY due_date ASC",
-        (client_id, agent_id),
+        "SELECT * FROM followups WHERE client_id = ? AND worker_id = ? AND done = 0 "
+        "ORDER BY due_date ASC",
+        (client_id, worker_id),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_followups_due_on(agent_id, due_date):
+def get_followups_due_on(worker_id, due_date):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone
+        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone,
+                  clients.status AS client_status
            FROM followups
            JOIN clients ON clients.id = followups.client_id
-           WHERE followups.agent_id = ? AND followups.due_date = ? AND followups.done = 0
+           WHERE followups.worker_id = ? AND followups.due_date = ? AND followups.done = 0
            ORDER BY followups.due_date ASC""",
-        (agent_id, due_date),
+        (worker_id, due_date),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_followups_between(agent_id, start_date, end_date):
+def get_followups_between(worker_id, start_date, end_date):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone
+        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone,
+                  clients.status AS client_status
            FROM followups
            JOIN clients ON clients.id = followups.client_id
-           WHERE followups.agent_id = ? AND followups.due_date BETWEEN ? AND ? AND followups.done = 0
+           WHERE followups.worker_id = ? AND followups.due_date BETWEEN ? AND ?
+                 AND followups.done = 0
            ORDER BY followups.due_date ASC""",
-        (agent_id, start_date, end_date),
+        (worker_id, start_date, end_date),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_overdue_followups(agent_id, today_str):
+def get_overdue_followups(worker_id, today_str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone
+        """SELECT followups.*, clients.name AS client_name, clients.phone AS client_phone,
+                  clients.status AS client_status
            FROM followups
            JOIN clients ON clients.id = followups.client_id
-           WHERE followups.agent_id = ? AND followups.due_date < ? AND followups.done = 0
+           WHERE followups.worker_id = ? AND followups.due_date < ? AND followups.done = 0
            ORDER BY followups.due_date ASC""",
-        (agent_id, today_str),
+        (worker_id, today_str),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def mark_followup_done(followup_id, agent_id):
+def mark_followup_done(followup_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE followups SET done = 1 WHERE id = ? AND agent_id = ?", (followup_id, agent_id)
+        "UPDATE followups SET done = 1 WHERE id = ? AND worker_id = ?",
+        (followup_id, worker_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_followup(followup_id, agent_id):
+def get_followup(followup_id, worker_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM followups WHERE id = ? AND agent_id = ?", (followup_id, agent_id)
+        "SELECT * FROM followups WHERE id = ? AND worker_id = ?", (followup_id, worker_id)
     )
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def all_active_agent_ids():
-    """Used by the daily reminder job to know which agents to message."""
+def all_worker_ids():
+    """Used by the daily reminder job."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM agents")
+    cur.execute("SELECT telegram_id FROM workers")
     rows = cur.fetchall()
     conn.close()
     return [r["telegram_id"] for r in rows]

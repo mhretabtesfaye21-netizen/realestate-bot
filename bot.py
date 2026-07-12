@@ -38,7 +38,7 @@ import logging
 from datetime import datetime, timedelta, time as dtime
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -166,11 +166,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if agent is None:
         agent = db.register_agent(user.id, user.full_name)
         await update.message.reply_text(
-            f"👋 Welcome to your Real Estate Client Assistant, {user.first_name}!\n"
+            f"👋 Welcome, {user.first_name}!\n"
             f"{owner_note}\n"
-            f"Your Telegram ID is: {user.id}\n"
-            f"You're on a free trial until {agent['trial_end']}.\n\n"
-            f"{HELP_TEXT}"
+            "I'll help you keep track of your clients and never miss a follow-up.\n\n"
+            f"You have a free trial until {agent['trial_end']} — no setup needed, "
+            "just start adding clients.\n\n"
+            "👉 Tap /addclient to add your first client\n"
+            "👉 Tap /help anytime to see everything I can do\n\n"
+            "Tip: tap the ⌨️ menu button next to the message box to see all commands.\n\n"
+            f"(Your Telegram ID, if you ever need it: {user.id})"
         )
         return
 
@@ -661,6 +665,47 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 
+AGENT_COMMANDS = [
+    BotCommand("addclient", "Add a new client"),
+    BotCommand("clients", "List all clients"),
+    BotCommand("find", "Search clients by name or phone"),
+    BotCommand("view", "View full client details"),
+    BotCommand("note", "Add a note to a client"),
+    BotCommand("stage", "Update a client's pipeline stage"),
+    BotCommand("followup", "Schedule a follow-up"),
+    BotCommand("today", "Today's follow-ups"),
+    BotCommand("week", "Follow-ups in the next 7 days"),
+    BotCommand("overdue", "Missed follow-ups"),
+    BotCommand("done", "Mark a follow-up complete"),
+    BotCommand("delete", "Delete a client"),
+    BotCommand("status", "Check your trial/subscription status"),
+    BotCommand("help", "Show all commands"),
+]
+
+OWNER_EXTRA_COMMANDS = [
+    BotCommand("agents", "List all agents and their status"),
+    BotCommand("approve", "Activate/extend an agent's subscription"),
+    BotCommand("revoke", "Cut off an agent's access"),
+    BotCommand("backup", "Download the current database file"),
+]
+
+
+async def setup_commands(application: Application):
+    """Sets up Telegram's tappable ⌨️ menu button. Everyone sees the regular
+    agent commands; the owner additionally sees the admin commands."""
+    await application.bot.set_my_commands(
+        AGENT_COMMANDS, scope=BotCommandScopeDefault()
+    )
+    if OWNER_CHAT_ID:
+        try:
+            await application.bot.set_my_commands(
+                AGENT_COMMANDS + OWNER_EXTRA_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=int(OWNER_CHAT_ID)),
+            )
+        except Exception:
+            logger.warning("Could not set owner-specific command menu.")
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit(
@@ -670,7 +715,7 @@ def main():
 
     db.init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     addclient_conv = ConversationHandler(
         entry_points=[CommandHandler("addclient", addclient_start)],
