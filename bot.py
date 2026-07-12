@@ -138,9 +138,32 @@ async def require_worker_access(update: Update):
 # /start and role registration
 # ---------------------------------------------------------------------------
 
+async def do_join(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
+    """Shared logic for joining an agency, used by both /join <code> and a
+    tapped invite link (t.me/YourBot?start=CODE)."""
+    user = update.effective_user
+    agency = db.get_agency_by_join_code(code)
+    if not agency:
+        await update.message.reply_text("That join code doesn't match any agency. Double-check with them.")
+        return
+    db.register_worker(user.id, agency["telegram_id"], user.full_name)
+    access = db.agency_has_access(agency)
+    lang = agency["language"] or "en"
+    await update.message.reply_text(
+        f"🧑‍💼 You've joined '{agency['name']}'!\n"
+        f"Access: {'✅ Active — you can start now.' if access else '🚫 Your agency is not yet active — check with them.'}\n\n"
+        f"{HELP_TEXT[lang] if access else ''}"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     role, row = await get_role(user.id)
+
+    # Tapped an invite link like t.me/YourBot?start=ABC123 — auto-join, no typing needed
+    if role is None and context.args:
+        await do_join(update, context, context.args[0])
+        return
 
     if role == "owner":
         await update.message.reply_text(
@@ -163,21 +186,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             f"🏢 Welcome back, {row['name']}!\n"
-            f"Status: {status_line}\n"
-            f"Your join code (share with your workers): {row['join_code']}\n\n"
+            f"Status: {status_line}\n\n"
+            "/invitelink - get a link to send your workers (they just tap it)\n"
             "/workers - see your workers\n"
-            "/joincode - show your join code again\n"
+            "/language - switch English/Amharic\n"
         )
         return
 
     if role == "worker":
         agency = db.get_agency(row["agency_id"])
         access = db.worker_has_access(row)
+        lang = agency["language"] if agency else "en"
         await update.message.reply_text(
             f"🧑‍💼 Welcome back, {user.first_name}!\n"
             f"Agency: {agency['name'] if agency else 'unknown'}\n"
             f"Access: {'✅ Active' if access else '🚫 Not active'}\n\n"
-            f"{HELP_TEXT}"
+            f"{HELP_TEXT[lang]}"
         )
         return
 
@@ -188,7 +212,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Are you registering as an Agency or joining as a Worker?\n\n"
         "🏢 To register a new agency:\n"
         "/register_agency <your agency name>\n\n"
-        "🧑‍💼 To join as a worker, get a join code from your agency, then:\n"
+        "🧑‍💼 To join as a worker, ask your agency for their invite link — "
+        "just tap it, no typing needed. Or if they gave you a code instead:\n"
         "/join <code>"
     )
 
@@ -204,6 +229,12 @@ async def register_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(context.args)
     agency = db.register_agency(user.id, name)
+    try:
+        await context.bot.set_my_commands(
+            AGENCY_COMMANDS, scope=BotCommandScopeChat(chat_id=user.id)
+        )
+    except Exception:
+        logger.warning("Could not set agency command menu for %s", user.id)
     await update.message.reply_text(
         f"🏢 Agency '{name}' registered! Status: pending approval.\n"
         f"Your Telegram ID: {user.id}\n\n"
@@ -235,19 +266,20 @@ async def join_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You're already registered. Send /start to see your info.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /join <code>\n(Get this code from your agency.)")
+        await update.message.reply_text("Usage: /join <code>\n(Get this code/link from your agency.)")
         return
-    code = context.args[0]
-    agency = db.get_agency_by_join_code(code)
+    await do_join(update, context, context.args[0])
+
+
+async def agency_invitelink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
     if not agency:
-        await update.message.reply_text("That join code doesn't match any agency. Double-check with them.")
+        await update.message.reply_text("This command is for registered agencies only.")
         return
-    db.register_worker(user.id, agency["telegram_id"], user.full_name)
-    access = db.agency_has_access(agency)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={agency['join_code']}"
     await update.message.reply_text(
-        f"🧑‍💼 You've joined '{agency['name']}'!\n"
-        f"Access: {'✅ Active — you can start now.' if access else '🚫 Your agency is not yet active — check with them.'}\n\n"
-        f"{HELP_TEXT if access else ''}"
+        f"📎 Send this link to your workers — they just tap it, nothing to type:\n\n{link}"
     )
 
 
@@ -257,29 +289,56 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-HELP_TEXT = (
-    "Here's what I can do:\n"
-    "/addclient - add a new client\n"
-    "/clients - list your clients (🔴🟡🟢 shows their status)\n"
-    "/find <keyword> - search by name or phone\n"
-    "/view <id> - see full client details\n"
-    "/note <id> <text> - add a note\n"
-    "/setstatus <id> <red|yellow|green> - update client status\n"
-    "/followup <id> <days> <text> - schedule a follow-up\n"
-    "/today - today's follow-ups\n"
-    "/week - follow-ups in next 7 days\n"
-    "/overdue - missed follow-ups\n"
-    "/done <followup_id> - mark follow-up complete\n"
-    "/delete <id> - remove a client\n"
-    "/help - show this list again anytime\n"
-)
+HELP_TEXT = {
+    "en": (
+        "Here's what I can do:\n"
+        "/addclient - add a new client\n"
+        "/clients - list your clients (🔴🟡🟢 shows their status)\n"
+        "/find <keyword> - search by name or phone\n"
+        "/view <id> - see full client details (tap 🔴🟡🟢 there to update status)\n"
+        "/note <id> <text> - add a note\n"
+        "/followup <id> <days> <text> - schedule a follow-up\n"
+        "/today - today's follow-ups\n"
+        "/week - follow-ups in next 7 days\n"
+        "/overdue - missed follow-ups\n"
+        "/done <followup_id> - mark follow-up complete\n"
+        "/delete <id> - remove a client\n"
+        "/help - show this list again anytime\n"
+    ),
+    "am": (
+        "የምችለው ነገሮች ዝርዝር፦\n"
+        "/addclient - አዲስ ደንበኛ ጨምር\n"
+        "/clients - ደንበኞችህን ዘርዝር (🔴🟡🟢 ሁኔታቸውን ያሳያል)\n"
+        "/find <ስም ወይም ስልክ> - ደንበኛ ፈልግ\n"
+        "/view <id> - ሙሉ ዝርዝር ተመልከት (🔴🟡🟢 ተጭነው ሁኔታውን ይቀይሩ)\n"
+        "/note <id> <ጽሑፍ> - ማስታወሻ ጨምር\n"
+        "/followup <id> <ቀናት> <ጽሑፍ> - ክትትል ያዘጋጁ\n"
+        "/today - ዛሬ የሚደረጉ ክትትሎች\n"
+        "/week - በሚቀጥሉት 7 ቀናት ውስጥ ያሉ ክትትሎች\n"
+        "/overdue - ያለፉ ክትትሎች\n"
+        "/done <followup_id> - ክትትል እንደ ተጠናቀቀ ምልክት አድርግ\n"
+        "/delete <id> - ደንበኛ አጥፋ\n"
+        "/help - ይህን ዝርዝር እንደገና አሳይ\n"
+    ),
+}
+
+STATUS_LABEL = {
+    "en": {"red": "not a buyer", "yellow": "in progress", "green": "bought"},
+    "am": {"red": "ገዢ አይደለም", "yellow": "በሂደት ላይ", "green": "ገዝቷል"},
+}
+
+
+def worker_language(worker_row) -> str:
+    agency = db.get_agency(worker_row["agency_id"])
+    return (agency["language"] if agency else "en") or "en"
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await require_worker_access(update)
     if not worker:
         return
-    await update.message.reply_text(HELP_TEXT)
+    lang = worker_language(worker)
+    await update.message.reply_text(HELP_TEXT[lang])
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +394,10 @@ async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No clients yet. Add one with /addclient")
         return
-    lines = [fmt_client_line(r) for r in rows]
-    await update.message.reply_text("👥 Clients:\n" + "\n".join(lines))
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(fmt_client_line(r), callback_data=f"viewclient:{r['id']}")] for r in rows]
+    )
+    await update.message.reply_text("👥 Tap a client to see details:", reply_markup=keyboard)
 
 
 async def clients_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -355,23 +416,12 @@ async def clients_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔎 Matches:\n" + "\n".join(lines))
 
 
-async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    worker = await require_worker_access(update)
-    if not worker:
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /view <client_id>")
-        return
-    try:
-        client_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Client id must be a number.")
-        return
-
+async def render_client_detail(worker, client_id):
+    """Builds the (text, keyboard) pair for a client's detail view. Returns
+    (None, None) if the client doesn't exist / doesn't belong to this worker."""
     client = db.get_client(client_id, worker["telegram_id"])
     if not client:
-        await update.message.reply_text("Client not found.")
-        return
+        return None, None
 
     dot = STATUS_EMOJI.get(client["status"], "⚪")
     msg = (
@@ -395,7 +445,32 @@ async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "📝 No notes yet."
 
-    await update.message.reply_text(msg)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔴 Red", callback_data=f"setstatus:{client_id}:red"),
+        InlineKeyboardButton("🟡 Yellow", callback_data=f"setstatus:{client_id}:yellow"),
+        InlineKeyboardButton("🟢 Green", callback_data=f"setstatus:{client_id}:green"),
+    ]])
+    return msg, keyboard
+
+
+async def client_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = await require_worker_access(update)
+    if not worker:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /view <client_id>")
+        return
+    try:
+        client_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Client id must be a number.")
+        return
+
+    msg, keyboard = await render_client_detail(worker, client_id)
+    if msg is None:
+        await update.message.reply_text("Client not found.")
+        return
+    await update.message.reply_text(msg, reply_markup=keyboard)
 
 
 async def client_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -592,8 +667,22 @@ async def agency_joincode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"Your join code: {agency['join_code']}\n"
-        "Share this with your workers. They join by sending:\n"
-        f"/join {agency['join_code']}"
+        "Share this with your workers, or better, use /invitelink so they don't have to type anything."
+    )
+
+
+async def agency_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    if not agency:
+        await update.message.reply_text("This command is for registered agencies only.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("English", callback_data="setlang:en"),
+        InlineKeyboardButton("አማርኛ (Amharic)", callback_data="setlang:am"),
+    ]])
+    await update.message.reply_text(
+        f"Current language: {agency['language']}\nChoose a language for your workers:",
+        reply_markup=keyboard,
     )
 
 
@@ -687,53 +776,94 @@ async def owner_revoke_agency(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-async def owner_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles taps on the Approve/Reject inline buttons."""
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all inline button taps: owner approve/reject, and worker
+    status changes / tapping a client from the list."""
     query = update.callback_query
     await query.answer()
-
-    if not OWNER_CHAT_ID or str(query.from_user.id) != str(OWNER_CHAT_ID):
-        await query.edit_message_text("This action is owner-only.")
-        return
-
     parts = query.data.split(":")
     action = parts[0]
 
-    if action == "approve":
-        telegram_id, days = int(parts[1]), int(parts[2])
-        agency = db.get_agency(telegram_id)
-        if not agency:
-            await query.edit_message_text("That agency no longer exists.")
+    # --- Owner-only actions ---
+    if action in ("approve", "reject"):
+        if not OWNER_CHAT_ID or str(query.from_user.id) != str(OWNER_CHAT_ID):
+            await query.edit_message_text("This action is owner-only.")
             return
-        db.approve_agency(telegram_id, days)
-        await query.edit_message_text(f"✅ Approved '{agency['name']}' for {days} days.")
-        try:
-            await context.bot.send_message(
-                chat_id=telegram_id,
-                text=(
-                    f"🎉 Your agency is now active for {days} days!\n"
-                    f"Your join code for workers: {agency['join_code']}\n"
-                    "Share /join <code> with your sales team."
-                ),
-            )
-        except Exception:
-            logger.warning("Could not notify agency %s of approval", telegram_id)
 
-    elif action == "reject":
-        telegram_id = int(parts[1])
-        agency = db.get_agency(telegram_id)
+        if action == "approve":
+            telegram_id, days = int(parts[1]), int(parts[2])
+            agency = db.get_agency(telegram_id)
+            if not agency:
+                await query.edit_message_text("That agency no longer exists.")
+                return
+            db.approve_agency(telegram_id, days)
+            await query.edit_message_text(f"✅ Approved '{agency['name']}' for {days} days.")
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        f"🎉 Your agency is now active for {days} days!\n"
+                        f"Your join code for workers: {agency['join_code']}\n"
+                        "Share /invitelink with your sales team, or give them the code."
+                    ),
+                )
+            except Exception:
+                logger.warning("Could not notify agency %s of approval", telegram_id)
+
+        elif action == "reject":
+            telegram_id = int(parts[1])
+            agency = db.get_agency(telegram_id)
+            if not agency:
+                await query.edit_message_text("That agency no longer exists.")
+                return
+            db.revoke_agency(telegram_id)
+            await query.edit_message_text(f"❌ Rejected '{agency['name']}'.")
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text="Your agency registration was not approved. Contact the owner for details.",
+                )
+            except Exception:
+                logger.warning("Could not notify agency %s of rejection", telegram_id)
+        return
+
+    # --- Agency actions ---
+    if action == "setlang":
+        agency = db.get_agency(query.from_user.id)
         if not agency:
-            await query.edit_message_text("That agency no longer exists.")
+            await query.edit_message_text("This action is for registered agencies only.")
             return
-        db.revoke_agency(telegram_id)
-        await query.edit_message_text(f"❌ Rejected '{agency['name']}'.")
-        try:
-            await context.bot.send_message(
-                chat_id=telegram_id,
-                text="Your agency registration was not approved. Contact the owner for details.",
-            )
-        except Exception:
-            logger.warning("Could not notify agency %s of rejection", telegram_id)
+        lang = parts[1]
+        db.set_agency_language(agency["telegram_id"], lang)
+        confirm = "✅ Language set to English." if lang == "en" else "✅ ቋንቋ ወደ አማርኛ ተቀይሯል።"
+        await query.edit_message_text(confirm)
+        return
+
+    # --- Worker actions: require the tapper to be an active worker ---
+    worker = db.get_worker(query.from_user.id)
+    if not worker or not db.worker_has_access(worker):
+        await query.edit_message_text("Your access isn't active right now.")
+        return
+
+    if action == "viewclient":
+        client_id = int(parts[1])
+        msg, keyboard = await render_client_detail(worker, client_id)
+        if msg is None:
+            await query.edit_message_text("Client not found.")
+            return
+        await query.edit_message_text(msg, reply_markup=keyboard)
+
+    elif action == "setstatus":
+        client_id, status = int(parts[1]), parts[2]
+        client = db.get_client(client_id, worker["telegram_id"])
+        if not client:
+            await query.edit_message_text("Client not found.")
+            return
+        db.set_client_status(client_id, worker["telegram_id"], status)
+        msg, keyboard = await render_client_detail(worker, client_id)
+        await query.edit_message_text(
+            f"{STATUS_EMOJI[status]} Status updated!\n\n{msg}", reply_markup=keyboard
+        )
 
 
 async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -805,6 +935,12 @@ WORKER_COMMANDS = [
     BotCommand("help", "Show all commands"),
 ]
 
+AGENCY_COMMANDS = [
+    BotCommand("invitelink", "Get a link for your workers to tap"),
+    BotCommand("workers", "See your workers"),
+    BotCommand("language", "Switch English/Amharic"),
+]
+
 OWNER_COMMANDS = [
     BotCommand("pending", "Agencies awaiting approval"),
     BotCommand("agencies", "All agencies and their status"),
@@ -867,6 +1003,8 @@ def main():
     # Agency-only
     application.add_handler(CommandHandler("workers", agency_workers))
     application.add_handler(CommandHandler("joincode", agency_joincode))
+    application.add_handler(CommandHandler("invitelink", agency_invitelink))
+    application.add_handler(CommandHandler("language", agency_language))
 
     # Owner-only
     application.add_handler(CommandHandler("pending", owner_pending))
@@ -874,7 +1012,7 @@ def main():
     application.add_handler(CommandHandler("approve_agency", owner_approve_agency))
     application.add_handler(CommandHandler("revoke_agency", owner_revoke_agency))
     application.add_handler(CommandHandler("backup", send_backup))
-    application.add_handler(CallbackQueryHandler(owner_button_tap))
+    application.add_handler(CallbackQueryHandler(callback_router))
 
     if application.job_queue:
         application.job_queue.run_daily(
