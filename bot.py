@@ -69,6 +69,7 @@ STATUS_EMOJI = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
 
 # Conversation states
 NAME, PHONE, INTEREST = range(3)
+REG_AGENCY_NAME, REG_WORKER_CODE = range(100, 102)
 
 
 # ---------------------------------------------------------------------------
@@ -205,29 +206,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Brand new person - ask them to choose a role
+    # Brand new person - let them tap instead of typing a command
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏢 I'm an Agency", callback_data="role:agency")],
+        [InlineKeyboardButton("🧑‍💼 I'm a Worker", callback_data="role:worker")],
+    ])
     await update.message.reply_text(
         "👋 Welcome! This bot helps real estate agencies manage properties, "
-        "workers, and clients.\n\n"
-        "Are you registering as an Agency or joining as a Worker?\n\n"
-        "🏢 To register a new agency:\n"
-        "/register_agency <your agency name>\n\n"
-        "🧑‍💼 To join as a worker, ask your agency for their invite link — "
-        "just tap it, no typing needed. Or if they gave you a code instead:\n"
-        "/join <code>"
+        "workers, and clients.\n\nWhat are you?",
+        reply_markup=keyboard,
     )
 
 
-async def register_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def finish_agency_registration(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str):
+    """Shared logic for registering an agency, used by both /register_agency
+    and the tap-a-button conversational flow."""
     user = update.effective_user
-    role, _ = await get_role(user.id)
-    if role is not None:
-        await update.message.reply_text("You're already registered. Send /start to see your info.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /register_agency <your agency name>")
-        return
-    name = " ".join(context.args)
     agency = db.register_agency(user.id, name)
     try:
         await context.bot.set_my_commands(
@@ -257,6 +251,60 @@ async def register_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.warning("Could not notify owner of new agency signup.")
+
+
+async def register_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Typed shortcut: /register_agency <name> in one message. Power-user path;
+    most people will use the tap-a-button flow from /start instead."""
+    user = update.effective_user
+    role, _ = await get_role(user.id)
+    if role is not None:
+        await update.message.reply_text("You're already registered. Send /start to see your info.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /register_agency <your agency name>")
+        return
+    name = " ".join(context.args)
+    await finish_agency_registration(update, context, name)
+
+
+async def role_agency_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    role, _ = await get_role(user.id)
+    if role is not None:
+        await query.edit_message_text("You're already registered. Send /start to see your info.")
+        return ConversationHandler.END
+    await query.edit_message_text("🏢 Great! What's your agency (or company) name? Just type it and send.")
+    return REG_AGENCY_NAME
+
+
+async def reg_agency_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    await finish_agency_registration(update, context, name)
+    return ConversationHandler.END
+
+
+async def role_worker_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    role, _ = await get_role(user.id)
+    if role is not None:
+        await query.edit_message_text("You're already registered. Send /start to see your info.")
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "🧑‍💼 Okay! Type the join code your agency gave you and send it.\n"
+        "(If they sent you a link instead, just tap that link directly — you don't need this.)"
+    )
+    return REG_WORKER_CODE
+
+
+async def reg_worker_code_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    await do_join(update, context, code)
+    return ConversationHandler.END
 
 
 async def join_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -983,10 +1031,23 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    registration_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(role_agency_tap, pattern="^role:agency$"),
+            CallbackQueryHandler(role_worker_tap, pattern="^role:worker$"),
+        ],
+        states={
+            REG_AGENCY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_agency_name_received)],
+            REG_WORKER_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_worker_code_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("register_agency", register_agency))
     application.add_handler(CommandHandler("join", join_worker))
     application.add_handler(addclient_conv)
+    application.add_handler(registration_conv)
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("find", clients_find))
     application.add_handler(CommandHandler("view", client_view))
@@ -1012,7 +1073,9 @@ def main():
     application.add_handler(CommandHandler("approve_agency", owner_approve_agency))
     application.add_handler(CommandHandler("revoke_agency", owner_revoke_agency))
     application.add_handler(CommandHandler("backup", send_backup))
-    application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(
+        CallbackQueryHandler(callback_router, pattern=r"^(approve|reject|setlang|viewclient|setstatus):")
+    )
 
     if application.job_queue:
         application.job_queue.run_daily(
