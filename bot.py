@@ -70,6 +70,7 @@ STATUS_EMOJI = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
 # Conversation states
 NAME, PHONE, INTEREST = range(3)
 REG_AGENCY_NAME, REG_WORKER_CODE = range(100, 102)
+PROPERTY_PHOTO, PROPERTY_DESCRIPTION = range(200, 202)
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +162,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     role, row = await get_role(user.id)
 
-    # Tapped an invite link like t.me/YourBot?start=ABC123 — auto-join, no typing needed
+    # Tapped a link like t.me/YourBot?start=PAYLOAD
     if role is None and context.args:
-        await do_join(update, context, context.args[0])
+        payload = context.args[0]
+        if payload.startswith("browse-"):
+            await start_browsing(update, context, payload[len("browse-"):])
+        else:
+            await do_join(update, context, payload)
         return
 
     if role == "owner":
@@ -188,16 +193,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🏢 Welcome back, {row['name']}!\n"
             f"Status: {status_line}\n\n"
+            "/addproperty - post a new property (photo + description)\n"
+            "/properties - see/manage your listings\n"
+            "/interests - see who's interested in what\n"
             "/invitelink - get a link to send your workers (they just tap it)\n"
             "/workers - see your workers\n"
-            "/language - switch English/Amharic\n"
+            "/agencylanguage - switch English/Amharic for your workers\n"
         )
         return
 
     if role == "worker":
         agency = db.get_agency(row["agency_id"])
         access = db.worker_has_access(row)
-        lang = agency["language"] if agency else "en"
+        lang = worker_language(row)
         await update.message.reply_text(
             f"🧑‍💼 Welcome back, {user.first_name}!\n"
             f"Agency: {agency['name'] if agency else 'unknown'}\n"
@@ -216,6 +224,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "workers, and clients.\n\nWhat are you?",
         reply_markup=keyboard,
     )
+
+
+async def start_browsing(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str):
+    """A client (their worker's customer) tapped their personal browse link.
+    Shows them their agency's property listings with an 'interested' button."""
+    client = db.get_client_by_token(token)
+    if not client:
+        await update.message.reply_text("This link isn't valid anymore. Please ask your agent for a new one.")
+        return
+    db.set_client_telegram_id(client["id"], update.effective_user.id)
+
+    agency = db.get_agency(client["agency_id"])
+    properties = db.list_properties(client["agency_id"])
+    if not properties:
+        await update.message.reply_text(
+            f"🏠 Welcome! {agency['name'] if agency else 'Your agent'} hasn't posted any "
+            "properties yet — check back soon!"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🏠 Welcome! Here are {agency['name'] if agency else 'our'} available properties. "
+        "Tap ❤️ on any you're interested in — your agent will be notified right away."
+    )
+    for p in properties:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❤️ I'm interested", callback_data=f"interest:{p['id']}:{client['id']}")
+        ]])
+        if p["photo_file_id"]:
+            await update.message.reply_photo(
+                photo=p["photo_file_id"], caption=p["description"], reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text(p["description"], reply_markup=keyboard)
 
 
 async def finish_agency_registration(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str):
@@ -351,6 +393,7 @@ HELP_TEXT = {
         "/overdue - missed follow-ups\n"
         "/done <followup_id> - mark follow-up complete\n"
         "/delete <id> - remove a client\n"
+        "/language - switch English/Amharic\n"
         "/help - show this list again anytime\n"
     ),
     "am": (
@@ -366,6 +409,7 @@ HELP_TEXT = {
         "/overdue - ያለፉ ክትትሎች\n"
         "/done <followup_id> - ክትትል እንደ ተጠናቀቀ ምልክት አድርግ\n"
         "/delete <id> - ደንበኛ አጥፋ\n"
+        "/language - ቋንቋ ቀይር\n"
         "/help - ይህን ዝርዝር እንደገና አሳይ\n"
     ),
 }
@@ -377,6 +421,8 @@ STATUS_LABEL = {
 
 
 def worker_language(worker_row) -> str:
+    if worker_row["language"]:
+        return worker_row["language"]
     agency = db.get_agency(worker_row["agency_id"])
     return (agency["language"] if agency else "en") or "en"
 
@@ -387,6 +433,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lang = worker_language(worker)
     await update.message.reply_text(HELP_TEXT[lang])
+
+
+async def worker_language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = await require_worker_access(update)
+    if not worker:
+        return
+    lang = worker_language(worker)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("English", callback_data="setlangworker:en"),
+        InlineKeyboardButton("አማርኛ (Amharic)", callback_data="setlangworker:am"),
+    ]])
+    await update.message.reply_text(
+        f"Current language: {lang}\nChoose your language:", reply_markup=keyboard
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +482,13 @@ async def addclient_interest(update: Update, context: ContextTypes.DEFAULT_TYPE)
         worker["telegram_id"], worker["agency_id"],
         context.user_data["name"], context.user_data["phone"], interest,
     )
+    client = db.get_client(client_id, worker["telegram_id"])
+    bot_username = (await context.bot.get_me()).username
+    browse_link = f"https://t.me/{bot_username}?start=browse-{client['client_token']}"
     await update.message.reply_text(
         f"✅ Client added as #{client_id}: {context.user_data['name']} (starts as 🔴 red)\n\n"
+        f"📎 Send them this link so they can browse our listings — tapping a property they "
+        f"like notifies you instantly:\n{browse_link}\n\n"
         f"Tip: /followup {client_id} 3 First call"
     )
     context.user_data.clear()
@@ -735,6 +800,77 @@ async def agency_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Properties (agency posts photo + description; clients browse & tap interest)
+# ---------------------------------------------------------------------------
+
+async def addproperty_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    if not agency:
+        await update.message.reply_text("This command is for registered agencies only.")
+        return ConversationHandler.END
+    if not db.agency_has_access(agency):
+        await update.message.reply_text("Your agency's access isn't active right now.")
+        return ConversationHandler.END
+    await update.message.reply_text("📸 Send a photo of the property.")
+    return PROPERTY_PHOTO
+
+
+async def addproperty_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo (not text). Or /cancel to stop.")
+        return PROPERTY_PHOTO
+    # Telegram sends multiple sizes - the last one is the largest
+    context.user_data["photo_file_id"] = update.message.photo[-1].file_id
+    await update.message.reply_text(
+        "Great! Now send a short description (price, location, rooms, etc.)."
+    )
+    return PROPERTY_DESCRIPTION
+
+
+async def addproperty_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    description = update.message.text.strip()
+    property_id = db.add_property(
+        agency["telegram_id"], context.user_data.get("photo_file_id"), description
+    )
+    await update.message.reply_text(f"✅ Property #{property_id} posted!")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    if not agency:
+        await update.message.reply_text("This command is for registered agencies only.")
+        return
+    props = db.list_properties(agency["telegram_id"])
+    if not props:
+        await update.message.reply_text("No properties posted yet. Use /addproperty to add one.")
+        return
+    for p in props:
+        caption = f"#{p['id']} — {p['description']}"
+        if p["photo_file_id"]:
+            await update.message.reply_photo(photo=p["photo_file_id"], caption=caption)
+        else:
+            await update.message.reply_text(caption)
+
+
+async def list_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    if not agency:
+        await update.message.reply_text("This command is for registered agencies only.")
+        return
+    rows = db.list_interests_for_agency(agency["telegram_id"])
+    if not rows:
+        await update.message.reply_text("No client interest yet.")
+        return
+    lines = [
+        f"• {r['client_name']} → {r['property_description'][:40]} ({r['created_at'][:16]})"
+        for r in rows
+    ]
+    await update.message.reply_text("❤️ Client interest:\n" + "\n".join(lines))
+
+
 # Owner-only commands
 # ---------------------------------------------------------------------------
 
@@ -875,6 +1011,35 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Could not notify agency %s of rejection", telegram_id)
         return
 
+    # --- Client action: tapping "interested" on a property (public, no login) ---
+    if action == "interest":
+        property_id, client_id = int(parts[1]), int(parts[2])
+        client = db.get_client_by_id(client_id)
+        prop = db.get_property(property_id)
+        if not client or not prop or prop["agency_id"] != client["agency_id"]:
+            await query.edit_message_reply_markup(reply_markup=None)
+            return
+        db.add_interest(client_id, property_id)
+        try:
+            if query.message.photo:
+                await query.edit_message_caption(
+                    caption=(query.message.caption or "") + "\n\n✅ You're interested — your agent will contact you soon!"
+                )
+            else:
+                await query.edit_message_text(
+                    (query.message.text or "") + "\n\n✅ You're interested — your agent will contact you soon!"
+                )
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=client["worker_id"],
+                text=f"🔔 {client['name']} is interested in a property:\n{prop['description'][:200]}",
+            )
+        except Exception:
+            logger.warning("Could not notify worker %s of client interest", client["worker_id"])
+        return
+
     # --- Agency actions ---
     if action == "setlang":
         agency = db.get_agency(query.from_user.id)
@@ -891,6 +1056,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = db.get_worker(query.from_user.id)
     if not worker or not db.worker_has_access(worker):
         await query.edit_message_text("Your access isn't active right now.")
+        return
+
+    if action == "setlangworker":
+        lang = parts[1]
+        db.set_worker_language(worker["telegram_id"], lang)
+        confirm = "✅ Language set to English." if lang == "en" else "✅ ቋንቋ ወደ አማርኛ ተቀይሯል።"
+        await query.edit_message_text(confirm)
         return
 
     if action == "viewclient":
@@ -980,13 +1152,17 @@ WORKER_COMMANDS = [
     BotCommand("overdue", "Missed follow-ups"),
     BotCommand("done", "Mark follow-up complete"),
     BotCommand("delete", "Delete a client"),
+    BotCommand("language", "Switch English/Amharic"),
     BotCommand("help", "Show all commands"),
 ]
 
 AGENCY_COMMANDS = [
+    BotCommand("addproperty", "Post a new property"),
+    BotCommand("properties", "See/manage your listings"),
+    BotCommand("interests", "See who's interested in what"),
     BotCommand("invitelink", "Get a link for your workers to tap"),
     BotCommand("workers", "See your workers"),
-    BotCommand("language", "Switch English/Amharic"),
+    BotCommand("agencylanguage", "Switch English/Amharic"),
 ]
 
 OWNER_COMMANDS = [
@@ -1043,11 +1219,21 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    addproperty_conv = ConversationHandler(
+        entry_points=[CommandHandler("addproperty", addproperty_start)],
+        states={
+            PROPERTY_PHOTO: [MessageHandler(filters.PHOTO, addproperty_photo)],
+            PROPERTY_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, addproperty_description)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("register_agency", register_agency))
     application.add_handler(CommandHandler("join", join_worker))
     application.add_handler(addclient_conv)
     application.add_handler(registration_conv)
+    application.add_handler(addproperty_conv)
     application.add_handler(CommandHandler("clients", clients_list))
     application.add_handler(CommandHandler("find", clients_find))
     application.add_handler(CommandHandler("view", client_view))
@@ -1060,12 +1246,15 @@ def main():
     application.add_handler(CommandHandler("overdue", followups_overdue))
     application.add_handler(CommandHandler("done", followup_done))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("language", worker_language_command))
 
     # Agency-only
     application.add_handler(CommandHandler("workers", agency_workers))
     application.add_handler(CommandHandler("joincode", agency_joincode))
     application.add_handler(CommandHandler("invitelink", agency_invitelink))
-    application.add_handler(CommandHandler("language", agency_language))
+    application.add_handler(CommandHandler("agencylanguage", agency_language))
+    application.add_handler(CommandHandler("properties", list_properties))
+    application.add_handler(CommandHandler("interests", list_interests))
 
     # Owner-only
     application.add_handler(CommandHandler("pending", owner_pending))
@@ -1074,7 +1263,10 @@ def main():
     application.add_handler(CommandHandler("revoke_agency", owner_revoke_agency))
     application.add_handler(CommandHandler("backup", send_backup))
     application.add_handler(
-        CallbackQueryHandler(callback_router, pattern=r"^(approve|reject|setlang|viewclient|setstatus):")
+        CallbackQueryHandler(
+            callback_router,
+            pattern=r"^(approve|reject|setlang|setlangworker|viewclient|setstatus|interest):",
+        )
     )
 
     if application.job_queue:

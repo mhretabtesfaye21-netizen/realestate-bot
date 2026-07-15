@@ -47,6 +47,7 @@ def init_db():
             telegram_id INTEGER PRIMARY KEY,
             agency_id INTEGER NOT NULL,
             name TEXT,
+            language TEXT,   -- NULL = use agency's language
             created_at TEXT,
             FOREIGN KEY (agency_id) REFERENCES agencies (telegram_id)
         )
@@ -61,6 +62,8 @@ def init_db():
             phone TEXT,
             interest TEXT,
             status TEXT DEFAULT 'red',   -- red | yellow | green
+            client_token TEXT UNIQUE,    -- used in their personal browse link
+            client_telegram_id INTEGER,  -- set once the client taps their link
             created_at TEXT
         )
     """)
@@ -83,6 +86,25 @@ def init_db():
             due_date TEXT NOT NULL,
             note TEXT,
             done INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS properties (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agency_id INTEGER NOT NULL,
+            photo_file_id TEXT,
+            description TEXT NOT NULL,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER NOT NULL,
+            property_id INTEGER NOT NULL,
             created_at TEXT
         )
     """)
@@ -240,20 +262,69 @@ def worker_has_access(worker_row):
     return agency_has_access(agency)
 
 
+def set_worker_language(telegram_id, language):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE workers SET language = ? WHERE telegram_id = ?", (language, telegram_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------- CLIENTS (scoped to one worker) ----------
+
+def _generate_client_token(cur):
+    while True:
+        token = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        cur.execute("SELECT 1 FROM clients WHERE client_token = ?", (token,))
+        if not cur.fetchone():
+            return token
+
 
 def add_client(worker_id, agency_id, name, phone, interest):
     conn = get_connection()
     cur = conn.cursor()
+    token = _generate_client_token(cur)
     cur.execute(
-        "INSERT INTO clients (worker_id, agency_id, name, phone, interest, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (worker_id, agency_id, name, phone, interest, datetime.now().isoformat()),
+        "INSERT INTO clients (worker_id, agency_id, name, phone, interest, client_token, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (worker_id, agency_id, name, phone, interest, token, datetime.now().isoformat()),
     )
     conn.commit()
     client_id = cur.lastrowid
     conn.close()
     return client_id
+
+
+def get_client_by_token(token):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM clients WHERE client_token = ?", (token,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_client_by_id(client_id):
+    """Unscoped lookup (no worker_id filter) — used for the client-facing
+    browse flow, where the visitor isn't a registered worker."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_client_telegram_id(client_id, telegram_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE clients SET client_telegram_id = ? WHERE id = ?", (telegram_id, client_id)
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_client(client_id, worker_id):
@@ -450,3 +521,80 @@ def all_worker_ids():
     rows = cur.fetchall()
     conn.close()
     return [r["telegram_id"] for r in rows]
+
+
+# ---------- PROPERTIES ----------
+
+def add_property(agency_id, photo_file_id, description):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO properties (agency_id, photo_file_id, description, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (agency_id, photo_file_id, description, datetime.now().isoformat()),
+    )
+    conn.commit()
+    property_id = cur.lastrowid
+    conn.close()
+    return property_id
+
+
+def list_properties(agency_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM properties WHERE agency_id = ? ORDER BY created_at DESC", (agency_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_property(property_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM properties WHERE id = ?", (property_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def delete_property(property_id, agency_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM properties WHERE id = ? AND agency_id = ?", (property_id, agency_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- INTERESTS (a client tapping "interested" on a property) ----------
+
+def add_interest(client_id, property_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO interests (client_id, property_id, created_at) VALUES (?, ?, ?)",
+        (client_id, property_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_interests_for_agency(agency_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT interests.*, clients.name AS client_name, clients.worker_id AS worker_id,
+                  properties.description AS property_description
+           FROM interests
+           JOIN clients ON clients.id = interests.client_id
+           JOIN properties ON properties.id = interests.property_id
+           WHERE clients.agency_id = ?
+           ORDER BY interests.created_at DESC""",
+        (agency_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
