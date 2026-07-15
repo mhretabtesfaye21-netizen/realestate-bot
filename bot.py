@@ -38,6 +38,7 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
@@ -66,6 +67,42 @@ BANK_INFO = os.environ.get("BANK_INFO", "")
 TELEBIRR_NUMBER = os.environ.get("TELEBIRR_NUMBER", "")
 
 STATUS_EMOJI = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
+
+# Persistent tap-menu labels (shown as buttons above the keyboard, not typed).
+MENU_LABELS = {
+    "owner": {
+        "en": [["⏳ Pending Agencies", "🏢 All Agencies"], ["💾 Backup"]],
+    },
+    "agency": {
+        "en": [
+            ["📸 Add Property", "🏠 My Properties"],
+            ["❤️ Interests", "🧑‍💼 Workers"],
+            ["🔗 Invite Link", "🌐 Language"],
+        ],
+        "am": [
+            ["📸 ንብረት ጨምር", "🏠 ንብረቶቼ"],
+            ["❤️ ፍላጎቶች", "🧑‍💼 ሰራተኞች"],
+            ["🔗 ሊንክ", "🌐 ቋንቋ"],
+        ],
+    },
+    "worker": {
+        "en": [
+            ["➕ Add Client", "👥 My Clients"],
+            ["📅 Today", "📆 This Week", "⚠️ Overdue"],
+            ["🌐 Language", "❓ Help"],
+        ],
+        "am": [
+            ["➕ ደንበኛ ጨምር", "👥 ደንበኞቼ"],
+            ["📅 ዛሬ", "📆 በዚህ ሳምንት", "⚠️ ያለፉ"],
+            ["🌐 ቋንቋ", "❓ እርዳታ"],
+        ],
+    },
+}
+
+
+def menu_keyboard(role: str, lang: str = "en") -> ReplyKeyboardMarkup:
+    layout = MENU_LABELS[role].get(lang, MENU_LABELS[role]["en"])
+    return ReplyKeyboardMarkup(layout, resize_keyboard=True)
 
 # Conversation states
 NAME, PHONE, INTEREST = range(3)
@@ -153,8 +190,8 @@ async def do_join(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str)
     lang = agency["language"] or "en"
     await update.message.reply_text(
         f"🧑‍💼 You've joined '{agency['name']}'!\n"
-        f"Access: {'✅ Active — you can start now.' if access else '🚫 Your agency is not yet active — check with them.'}\n\n"
-        f"{HELP_TEXT[lang] if access else ''}"
+        f"Access: {'✅ Active — you can start now.' if access else '🚫 Your agency is not yet active — check with them.'}",
+        reply_markup=menu_keyboard("worker", lang) if access else None,
     )
 
 
@@ -173,12 +210,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if role == "owner":
         await update.message.reply_text(
-            f"👑 Welcome back, Owner!\n\n"
-            "/pending - agencies awaiting approval\n"
-            "/agencies - all agencies and their status\n"
-            "/approve_agency <id> <days> - activate an agency\n"
-            "/revoke_agency <id> - cut off an agency\n"
-            "/backup - download the database\n"
+            "👑 Welcome back, Owner! Use the menu below, or type /approve_agency and "
+            "/revoke_agency directly when you need to act on a specific ID.",
+            reply_markup=menu_keyboard("owner"),
         )
         return
 
@@ -191,14 +225,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "Revoked"
         )
         await update.message.reply_text(
-            f"🏢 Welcome back, {row['name']}!\n"
-            f"Status: {status_line}\n\n"
-            "/addproperty - post a new property (photo + description)\n"
-            "/properties - see/manage your listings\n"
-            "/interests - see who's interested in what\n"
-            "/invitelink - get a link to send your workers (they just tap it)\n"
-            "/workers - see your workers\n"
-            "/agencylanguage - switch English/Amharic for your workers\n"
+            f"🏢 Welcome back, {row['name']}!\nStatus: {status_line}\n\nUse the menu below.",
+            reply_markup=menu_keyboard("agency", row["language"] or "en"),
         )
         return
 
@@ -209,8 +237,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🧑‍💼 Welcome back, {user.first_name}!\n"
             f"Agency: {agency['name'] if agency else 'unknown'}\n"
-            f"Access: {'✅ Active' if access else '🚫 Not active'}\n\n"
-            f"{HELP_TEXT[lang]}"
+            f"Access: {'✅ Active' if access else '🚫 Not active'}\n\nUse the menu below.",
+            reply_markup=menu_keyboard("worker", lang),
         )
         return
 
@@ -275,7 +303,8 @@ async def finish_agency_registration(update: Update, context: ContextTypes.DEFAU
         f"🏢 Agency '{name}' registered! Status: pending approval.\n"
         f"Your Telegram ID: {user.id}\n\n"
         "The owner needs to approve you before you can use the bot — "
-        "they've been notified." + payment_instructions()
+        "they've been notified." + payment_instructions(),
+        reply_markup=menu_keyboard("agency"),
     )
     if OWNER_CHAT_ID:
         try:
@@ -935,8 +964,9 @@ async def owner_approve_agency(update: Update, context: ContextTypes.DEFAULT_TYP
             text=(
                 f"🎉 Your agency is now active for {days} days!\n"
                 f"Your join code for workers: {agency['join_code']}\n"
-                "Share /join <code> with your sales team."
+                "Share /invitelink with your sales team."
             ),
+            reply_markup=menu_keyboard("agency", agency["language"] or "en"),
         )
     except Exception:
         logger.warning("Could not notify agency %s of approval", telegram_id)
@@ -990,6 +1020,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Your join code for workers: {agency['join_code']}\n"
                         "Share /invitelink with your sales team, or give them the code."
                     ),
+                    reply_markup=menu_keyboard("agency", agency["language"] or "en"),
                 )
             except Exception:
                 logger.warning("Could not notify agency %s of approval", telegram_id)
@@ -1085,6 +1116,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{STATUS_EMOJI[status]} Status updated!\n\n{msg}", reply_markup=keyboard
         )
 
+
+# ---------------------------------------------------------------------------
+# Menu button router — dispatches taps on the persistent tap-menu to the
+# existing command functions, so nobody has to type /commands for the
+# common, no-typing-needed actions. (Defined further down, after every
+# function it references already exists.)
+# ---------------------------------------------------------------------------
 
 async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -1189,6 +1227,82 @@ async def setup_commands(application: Application):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Menu button router — for the SIMPLE, no-conversation actions only.
+# "Add Client" and "Add Property" are handled as ConversationHandler entry
+# points instead (registered in main()), since they need multi-step input.
+# ---------------------------------------------------------------------------
+
+OWNER_MENU_ACTIONS = {
+    "⏳ Pending Agencies": owner_pending,
+    "🏢 All Agencies": owner_agencies,
+    "💾 Backup": send_backup,
+}
+
+AGENCY_MENU_ACTIONS = {
+    "en": {
+        "🏠 My Properties": list_properties,
+        "❤️ Interests": list_interests,
+        "🧑‍💼 Workers": agency_workers,
+        "🔗 Invite Link": agency_invitelink,
+        "🌐 Language": agency_language,
+    },
+    "am": {
+        "🏠 ንብረቶቼ": list_properties,
+        "❤️ ፍላጎቶች": list_interests,
+        "🧑‍💼 ሰራተኞች": agency_workers,
+        "🔗 ሊንክ": agency_invitelink,
+        "🌐 ቋንቋ": agency_language,
+    },
+}
+
+WORKER_MENU_ACTIONS = {
+    "en": {
+        "👥 My Clients": clients_list,
+        "📅 Today": followups_today,
+        "📆 This Week": followups_week,
+        "⚠️ Overdue": followups_overdue,
+        "🌐 Language": worker_language_command,
+        "❓ Help": help_command,
+    },
+    "am": {
+        "👥 ደንበኞቼ": clients_list,
+        "📅 ዛሬ": followups_today,
+        "📆 በዚህ ሳምንት": followups_week,
+        "⚠️ ያለፉ": followups_overdue,
+        "🌐 ቋንቋ": worker_language_command,
+        "❓ እርዳታ": help_command,
+    },
+}
+
+
+async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches plain text messages and, if they match a tap-menu button
+    label for this person's role, runs the matching action. Anything that
+    doesn't match is silently ignored (so stray text doesn't error out)."""
+    text = update.message.text
+    user = update.effective_user
+    role, row = await get_role(user.id)
+
+    if role == "owner" and text in OWNER_MENU_ACTIONS:
+        await OWNER_MENU_ACTIONS[text](update, context)
+        return
+
+    if role == "agency":
+        lang = row["language"] or "en"
+        actions = AGENCY_MENU_ACTIONS.get(lang, AGENCY_MENU_ACTIONS["en"])
+        if text in actions:
+            await actions[text](update, context)
+        return
+
+    if role == "worker":
+        lang = worker_language(row)
+        actions = WORKER_MENU_ACTIONS.get(lang, WORKER_MENU_ACTIONS["en"])
+        if text in actions:
+            await actions[text](update, context)
+        return
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set. Fill in your .env file.")
@@ -1198,7 +1312,10 @@ def main():
     application = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     addclient_conv = ConversationHandler(
-        entry_points=[CommandHandler("addclient", addclient_start)],
+        entry_points=[
+            CommandHandler("addclient", addclient_start),
+            MessageHandler(filters.Text(["➕ Add Client", "➕ ደንበኛ ጨምር"]), addclient_start),
+        ],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addclient_name)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addclient_phone)],
@@ -1220,7 +1337,10 @@ def main():
     )
 
     addproperty_conv = ConversationHandler(
-        entry_points=[CommandHandler("addproperty", addproperty_start)],
+        entry_points=[
+            CommandHandler("addproperty", addproperty_start),
+            MessageHandler(filters.Text(["📸 Add Property", "📸 ንብረት ጨምር"]), addproperty_start),
+        ],
         states={
             PROPERTY_PHOTO: [MessageHandler(filters.PHOTO, addproperty_photo)],
             PROPERTY_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, addproperty_description)],
@@ -1268,6 +1388,11 @@ def main():
             pattern=r"^(approve|reject|setlang|setlangworker|viewclient|setstatus|interest):",
         )
     )
+
+    # Catch-all for tap-menu button presses - must be LAST so commands and
+    # active conversations (addclient, addproperty, registration) take
+    # priority over it.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_button_router))
 
     if application.job_queue:
         application.job_queue.run_daily(
