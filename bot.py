@@ -193,6 +193,8 @@ async def do_join(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str)
         f"Access: {'✅ Active — you can start now.' if access else '🚫 Your agency is not yet active — check with them.'}",
         reply_markup=menu_keyboard("worker", lang) if access else None,
     )
+    if access:
+        await send_quick_menu(update.effective_chat.id, context, "worker", lang)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,10 +212,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if role == "owner":
         await update.message.reply_text(
-            "👑 Welcome back, Owner! Use the menu below, or type /approve_agency and "
-            "/revoke_agency directly when you need to act on a specific ID.",
+            "👑 Welcome back, Owner! Type /approve_agency and /revoke_agency directly "
+            "when you need to act on a specific ID.",
             reply_markup=menu_keyboard("owner"),
         )
+        await send_quick_menu(update.effective_chat.id, context, "owner")
         return
 
     if role == "agency":
@@ -225,9 +228,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "Revoked"
         )
         await update.message.reply_text(
-            f"🏢 Welcome back, {row['name']}!\nStatus: {status_line}\n\nUse the menu below.",
+            f"🏢 Welcome back, {row['name']}!\nStatus: {status_line}",
             reply_markup=menu_keyboard("agency", row["language"] or "en"),
         )
+        await send_quick_menu(update.effective_chat.id, context, "agency", row["language"] or "en")
         return
 
     if role == "worker":
@@ -237,9 +241,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🧑‍💼 Welcome back, {user.first_name}!\n"
             f"Agency: {agency['name'] if agency else 'unknown'}\n"
-            f"Access: {'✅ Active' if access else '🚫 Not active'}\n\nUse the menu below.",
+            f"Access: {'✅ Active' if access else '🚫 Not active'}",
             reply_markup=menu_keyboard("worker", lang),
         )
+        if access:
+            await send_quick_menu(update.effective_chat.id, context, "worker", lang)
         return
 
     # Brand new person - let them tap instead of typing a command
@@ -398,7 +404,8 @@ async def agency_invitelink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start={agency['join_code']}"
     await update.message.reply_text(
-        f"📎 Send this link to your workers — they just tap it, nothing to type:\n\n{link}"
+        f"📎 Send this link to your workers — they just tap it, nothing to type:\n\n{link}",
+        reply_markup=menu_keyboard("agency", agency["language"] or "en"),
     )
 
 
@@ -461,7 +468,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not worker:
         return
     lang = worker_language(worker)
-    await update.message.reply_text(HELP_TEXT[lang])
+    await update.message.reply_text(HELP_TEXT[lang], reply_markup=menu_keyboard("worker", lang))
 
 
 async def worker_language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -532,14 +539,19 @@ async def clients_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await require_worker_access(update)
     if not worker:
         return
+    lang = worker_language(worker)
     rows = db.list_clients(worker["telegram_id"])
     if not rows:
-        await update.message.reply_text("No clients yet. Add one with /addclient")
+        await update.message.reply_text(
+            "No clients yet. Add one with /addclient", reply_markup=menu_keyboard("worker", lang)
+        )
         return
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton(fmt_client_line(r), callback_data=f"viewclient:{r['id']}")] for r in rows]
     )
     await update.message.reply_text("👥 Tap a client to see details:", reply_markup=keyboard)
+    # Re-send the bottom menu right after, so it doesn't collapse behind "Menu"
+    await update.message.reply_text("Use the buttons below 👇", reply_markup=menu_keyboard("worker", lang))
 
 
 async def clients_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -722,42 +734,53 @@ async def followups_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await require_worker_access(update)
     if not worker:
         return
+    lang = worker_language(worker)
     today_str = datetime.now().strftime("%Y-%m-%d")
     rows = db.get_followups_due_on(worker["telegram_id"], today_str)
     if not rows:
-        await update.message.reply_text("✅ No follow-ups due today.")
+        await update.message.reply_text("✅ No follow-ups due today.", reply_markup=menu_keyboard("worker", lang))
         return
     lines = [fmt_followup_line(r) for r in rows]
-    await update.message.reply_text("📅 Today's follow-ups:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "📅 Today's follow-ups:\n" + "\n".join(lines), reply_markup=menu_keyboard("worker", lang)
+    )
 
 
 async def followups_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await require_worker_access(update)
     if not worker:
         return
+    lang = worker_language(worker)
     today = datetime.now()
     end = today + timedelta(days=7)
     rows = db.get_followups_between(
         worker["telegram_id"], today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
     )
     if not rows:
-        await update.message.reply_text("No follow-ups in the next 7 days.")
+        await update.message.reply_text(
+            "No follow-ups in the next 7 days.", reply_markup=menu_keyboard("worker", lang)
+        )
         return
     lines = [fmt_followup_line(r) for r in rows]
-    await update.message.reply_text("📅 Next 7 days:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "📅 Next 7 days:\n" + "\n".join(lines), reply_markup=menu_keyboard("worker", lang)
+    )
 
 
 async def followups_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = await require_worker_access(update)
     if not worker:
         return
+    lang = worker_language(worker)
     today_str = datetime.now().strftime("%Y-%m-%d")
     rows = db.get_overdue_followups(worker["telegram_id"], today_str)
     if not rows:
-        await update.message.reply_text("🎉 Nothing overdue.")
+        await update.message.reply_text("🎉 Nothing overdue.", reply_markup=menu_keyboard("worker", lang))
         return
     lines = [fmt_followup_line(r) for r in rows]
-    await update.message.reply_text("⚠️ Overdue follow-ups:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "⚠️ Overdue follow-ups:\n" + "\n".join(lines), reply_markup=menu_keyboard("worker", lang)
+    )
 
 
 async def followup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,14 +815,18 @@ async def agency_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not agency:
         await update.message.reply_text("This command is for registered agencies only.")
         return
+    lang = agency["language"] or "en"
     workers = db.list_workers_for_agency(agency["telegram_id"])
     if not workers:
         await update.message.reply_text(
-            f"No workers yet. Share your join code with them: {agency['join_code']}"
+            f"No workers yet. Share your join code with them: {agency['join_code']}",
+            reply_markup=menu_keyboard("agency", lang),
         )
         return
     lines = [f"• {w['name']} (ID: {w['telegram_id']})" for w in workers]
-    await update.message.reply_text("🧑‍💼 Your workers:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "🧑‍💼 Your workers:\n" + "\n".join(lines), reply_markup=menu_keyboard("agency", lang)
+    )
 
 
 async def agency_joincode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -872,9 +899,13 @@ async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not agency:
         await update.message.reply_text("This command is for registered agencies only.")
         return
+    lang = agency["language"] or "en"
     props = db.list_properties(agency["telegram_id"])
     if not props:
-        await update.message.reply_text("No properties posted yet. Use /addproperty to add one.")
+        await update.message.reply_text(
+            "No properties posted yet. Use /addproperty to add one.",
+            reply_markup=menu_keyboard("agency", lang),
+        )
         return
     for p in props:
         caption = f"#{p['id']} — {p['description']}"
@@ -882,6 +913,7 @@ async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_photo(photo=p["photo_file_id"], caption=caption)
         else:
             await update.message.reply_text(caption)
+    await update.message.reply_text("Use the buttons below 👇", reply_markup=menu_keyboard("agency", lang))
 
 
 async def list_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -889,15 +921,18 @@ async def list_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not agency:
         await update.message.reply_text("This command is for registered agencies only.")
         return
+    lang = agency["language"] or "en"
     rows = db.list_interests_for_agency(agency["telegram_id"])
     if not rows:
-        await update.message.reply_text("No client interest yet.")
+        await update.message.reply_text("No client interest yet.", reply_markup=menu_keyboard("agency", lang))
         return
     lines = [
         f"• {r['client_name']} → {r['property_description'][:40]} ({r['created_at'][:16]})"
         for r in rows
     ]
-    await update.message.reply_text("❤️ Client interest:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "❤️ Client interest:\n" + "\n".join(lines), reply_markup=menu_keyboard("agency", lang)
+    )
 
 
 # Owner-only commands
@@ -909,7 +944,9 @@ async def owner_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = db.list_pending_agencies()
     if not rows:
-        await update.message.reply_text("No agencies waiting for approval.")
+        await update.message.reply_text(
+            "No agencies waiting for approval.", reply_markup=menu_keyboard("owner")
+        )
         return
     for r in rows:
         keyboard = InlineKeyboardMarkup([
@@ -922,6 +959,7 @@ async def owner_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ {r['name']} (ID: {r['telegram_id']})", reply_markup=keyboard
         )
+    await update.message.reply_text("Use the buttons below 👇", reply_markup=menu_keyboard("owner"))
 
 
 async def owner_agencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,13 +968,15 @@ async def owner_agencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = db.list_agencies()
     if not rows:
-        await update.message.reply_text("No agencies registered yet.")
+        await update.message.reply_text("No agencies registered yet.", reply_markup=menu_keyboard("owner"))
         return
     lines = []
     for r in rows:
         detail = r["subscription_end"] if r["status"] == "active" else "-"
         lines.append(f"• {r['telegram_id']} — {r['name']} — {r['status']} (until {detail})")
-    await update.message.reply_text("🏢 Agencies:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "🏢 Agencies:\n" + "\n".join(lines), reply_markup=menu_keyboard("owner")
+    )
 
 
 async def owner_approve_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1081,6 +1121,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_agency_language(agency["telegram_id"], lang)
         confirm = "✅ Language set to English." if lang == "en" else "✅ ቋንቋ ወደ አማርኛ ተቀይሯል።"
         await query.edit_message_text(confirm)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="Use the buttons below 👇",
+            reply_markup=menu_keyboard("agency", lang),
+        )
         return
 
     # --- Worker actions: require the tapper to be an active worker ---
@@ -1094,6 +1139,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_worker_language(worker["telegram_id"], lang)
         confirm = "✅ Language set to English." if lang == "en" else "✅ ቋንቋ ወደ አማርኛ ተቀይሯል።"
         await query.edit_message_text(confirm)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="Use the buttons below 👇",
+            reply_markup=menu_keyboard("worker", lang),
+        )
         return
 
     if action == "viewclient":
@@ -1129,7 +1179,7 @@ async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This command is owner-only.")
         return
     if not os.path.exists(db.DB_PATH):
-        await update.message.reply_text("No database file found yet.")
+        await update.message.reply_text("No database file found yet.", reply_markup=menu_keyboard("owner"))
         return
     try:
         with open(db.DB_PATH, "rb") as f:
@@ -1138,9 +1188,12 @@ async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=f"backup_{datetime.now().strftime('%Y-%m-%d')}.db",
                 caption="📦 Here's your current backup.",
             )
+        await update.message.reply_text("Use the buttons below 👇", reply_markup=menu_keyboard("owner"))
     except Exception as e:
         logger.warning("Backup failed: %s", e)
-        await update.message.reply_text("Something went wrong sending the backup.")
+        await update.message.reply_text(
+            "Something went wrong sending the backup.", reply_markup=menu_keyboard("owner")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1276,6 +1329,82 @@ WORKER_MENU_ACTIONS = {
 }
 
 
+OWNER_ACTIONS_BY_KEY = {
+    "pending": owner_pending,
+    "agencies": owner_agencies,
+    "backup": send_backup,
+}
+OWNER_QUICK_MENU_LABELS = {
+    "pending": "⏳ Pending Agencies",
+    "agencies": "🏢 All Agencies",
+    "backup": "💾 Backup",
+}
+
+AGENCY_ACTIONS_BY_KEY = {
+    "properties": list_properties,
+    "interests": list_interests,
+    "workers": agency_workers,
+    "invitelink": agency_invitelink,
+    "language": agency_language,
+}
+AGENCY_QUICK_MENU_LABELS = {
+    "en": {
+        "properties": "🏠 My Properties", "interests": "❤️ Interests",
+        "workers": "🧑‍💼 Workers", "invitelink": "🔗 Invite Link", "language": "🌐 Language",
+    },
+    "am": {
+        "properties": "🏠 ንብረቶቼ", "interests": "❤️ ፍላጎቶች",
+        "workers": "🧑‍💼 ሰራተኞች", "invitelink": "🔗 ሊንክ", "language": "🌐 ቋንቋ",
+    },
+}
+
+WORKER_ACTIONS_BY_KEY = {
+    "clients": clients_list,
+    "today": followups_today,
+    "week": followups_week,
+    "overdue": followups_overdue,
+    "language": worker_language_command,
+    "help": help_command,
+}
+WORKER_QUICK_MENU_LABELS = {
+    "en": {
+        "clients": "👥 My Clients", "today": "📅 Today", "week": "📆 This Week",
+        "overdue": "⚠️ Overdue", "language": "🌐 Language", "help": "❓ Help",
+    },
+    "am": {
+        "clients": "👥 ደንበኞቼ", "today": "📅 ዛሬ", "week": "📆 በዚህ ሳምንት",
+        "overdue": "⚠️ ያለፉ", "language": "🌐 ቋንቋ", "help": "❓ እርዳታ",
+    },
+}
+
+
+def quick_menu_inline(role: str, lang: str = "en") -> InlineKeyboardMarkup:
+    """Buttons attached directly under a message — these never collapse or
+    need re-opening, unlike the bottom reply-keyboard row."""
+    if role == "owner":
+        labels = OWNER_QUICK_MENU_LABELS
+    elif role == "agency":
+        labels = AGENCY_QUICK_MENU_LABELS.get(lang, AGENCY_QUICK_MENU_LABELS["en"])
+    else:
+        labels = WORKER_QUICK_MENU_LABELS.get(lang, WORKER_QUICK_MENU_LABELS["en"])
+
+    buttons, row_buf = [], []
+    for key, label in labels.items():
+        row_buf.append(InlineKeyboardButton(label, callback_data=f"menuact:{role}:{key}"))
+        if len(row_buf) == 2:
+            buttons.append(row_buf)
+            row_buf = []
+    if row_buf:
+        buttons.append(row_buf)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def send_quick_menu(chat_id, context, role, lang="en"):
+    await context.bot.send_message(
+        chat_id=chat_id, text="⬇️ Quick actions:", reply_markup=quick_menu_inline(role, lang)
+    )
+
+
 async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Catches plain text messages and, if they match a tap-menu button
     label for this person's role, runs the matching action. Anything that
@@ -1286,6 +1415,7 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if role == "owner" and text in OWNER_MENU_ACTIONS:
         await OWNER_MENU_ACTIONS[text](update, context)
+        await send_quick_menu(update.effective_chat.id, context, "owner")
         return
 
     if role == "agency":
@@ -1293,6 +1423,7 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         actions = AGENCY_MENU_ACTIONS.get(lang, AGENCY_MENU_ACTIONS["en"])
         if text in actions:
             await actions[text](update, context)
+            await send_quick_menu(update.effective_chat.id, context, "agency", lang)
         return
 
     if role == "worker":
@@ -1300,6 +1431,37 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         actions = WORKER_MENU_ACTIONS.get(lang, WORKER_MENU_ACTIONS["en"])
         if text in actions:
             await actions[text](update, context)
+            await send_quick_menu(update.effective_chat.id, context, "worker", lang)
+        return
+
+
+async def menu_inline_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the never-collapsing inline quick-menu buttons."""
+    query = update.callback_query
+    await query.answer()
+    _, role, key = query.data.split(":")
+
+    # Small adapter so we can reuse the exact same functions the typed
+    # commands use — they only need .effective_user and .message.reply_*
+    adapter = type("Adapter", (), {"effective_user": query.from_user, "message": query.message})()
+
+    if role == "owner" and is_owner(update) and key in OWNER_ACTIONS_BY_KEY:
+        await OWNER_ACTIONS_BY_KEY[key](adapter, context)
+        await send_quick_menu(query.message.chat_id, context, "owner")
+        return
+
+    if role == "agency":
+        agency = db.get_agency(query.from_user.id)
+        if agency and key in AGENCY_ACTIONS_BY_KEY:
+            await AGENCY_ACTIONS_BY_KEY[key](adapter, context)
+            await send_quick_menu(query.message.chat_id, context, "agency", agency["language"] or "en")
+        return
+
+    if role == "worker":
+        worker = db.get_worker(query.from_user.id)
+        if worker and db.worker_has_access(worker) and key in WORKER_ACTIONS_BY_KEY:
+            await WORKER_ACTIONS_BY_KEY[key](adapter, context)
+            await send_quick_menu(query.message.chat_id, context, "worker", worker_language(worker))
         return
 
 
@@ -1388,6 +1550,7 @@ def main():
             pattern=r"^(approve|reject|setlang|setlangworker|viewclient|setstatus|interest):",
         )
     )
+    application.add_handler(CallbackQueryHandler(menu_inline_tap, pattern=r"^menuact:"))
 
     # Catch-all for tap-menu button presses - must be LAST so commands and
     # active conversations (addclient, addproperty, registration) take
