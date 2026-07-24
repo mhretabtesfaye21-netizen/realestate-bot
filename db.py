@@ -598,3 +598,63 @@ def list_interests_for_agency(agency_id):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+# ---------- LEADERBOARD (ranking workers by clients marked 🟢 sold) ----------
+
+def get_leaderboard(agency_id):
+    """Every worker in this agency, ranked by how many of their clients are
+    marked 'green' (sold). Workers with zero sales still appear (0 is a
+    valid rank), so nobody's missing from the board."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT workers.telegram_id, workers.name,
+                  COALESCE(SUM(CASE WHEN clients.status = 'green' THEN 1 ELSE 0 END), 0) AS sold_count
+           FROM workers
+           LEFT JOIN clients ON clients.worker_id = workers.telegram_id
+           WHERE workers.agency_id = ?
+           GROUP BY workers.telegram_id
+           ORDER BY sold_count DESC, workers.created_at ASC""",
+        (agency_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ---------- NEXT BEST ACTION (who a worker should contact next, and why) ----------
+
+def get_stalled_yellow_clients(worker_id):
+    """Yellow (in-progress) clients with no upcoming follow-up scheduled —
+    these are at risk of going cold if nobody follows up."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT * FROM clients
+           WHERE worker_id = ? AND status = 'yellow'
+             AND id NOT IN (SELECT client_id FROM followups WHERE worker_id = ? AND done = 0)
+           ORDER BY created_at ASC""",
+        (worker_id, worker_id),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_untouched_red_clients(worker_id):
+    """Red (new) clients with no notes and no follow-up ever scheduled —
+    meaning first contact hasn't happened yet."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT * FROM clients
+           WHERE worker_id = ? AND status = 'red'
+             AND id NOT IN (SELECT client_id FROM notes WHERE worker_id = ?)
+             AND id NOT IN (SELECT client_id FROM followups WHERE worker_id = ?)
+           ORDER BY created_at ASC""",
+        (worker_id, worker_id, worker_id),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows

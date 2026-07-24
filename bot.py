@@ -27,6 +27,7 @@ Worker commands (require their agency to be active):
 """
 
 import os
+import random
 import logging
 from datetime import datetime, timedelta, time as dtime
 
@@ -394,6 +395,9 @@ HELP_TEXT = {
         "/overdue - missed follow-ups\n"
         "/done <followup_id> - mark follow-up complete\n"
         "/delete <id> - remove a client\n"
+        "/nextaction - who to contact next, and why\n"
+        "/tips - short proven sales tips\n"
+        "/leaderboard - see the team ranking\n"
         "/language - switch English/Amharic\n"
         "/help - show this list again anytime\n"
     ),
@@ -410,6 +414,9 @@ HELP_TEXT = {
         "/overdue - ያለፉ ክትትሎች\n"
         "/done <followup_id> - ክትትል እንደ ተጠናቀቀ ምልክት አድርግ\n"
         "/delete <id> - ደንበኛ አጥፋ\n"
+        "/nextaction - ቀጥሎ ማን ማነጋገር እንዳለብዎ\n"
+        "/tips - አጭር ውጤታማ ምክሮች\n"
+        "/leaderboard - የቡድን ደረጃ ይመልከቱ\n"
         "/language - ቋንቋ ቀይር\n"
         "/help - ይህን ዝርዝር እንደገና አሳይ\n"
     ),
@@ -563,6 +570,9 @@ async def render_client_detail(worker, client_id):
         msg += "\n".join(f"  [{n['created_at'][:16]}] {n['text']}" for n in notes[:10])
     else:
         msg += "📝 No notes yet."
+
+    tip = random.choice(SALES_TIPS.get(client["status"], SALES_TIPS["general"]))
+    msg += f"\n\n💡 Tip: {tip}"
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔴 Red", callback_data=f"setstatus:{client_id}:red"),
@@ -898,6 +908,141 @@ async def list_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ Client interest:\n" + "\n".join(lines), reply_markup=ReplyKeyboardRemove()
     )
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard — ranks workers within an agency by clients marked 🟢 sold
+# ---------------------------------------------------------------------------
+
+def format_leaderboard(rows, highlight_id=None):
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows):
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        marker = " ← you" if highlight_id is not None and r["telegram_id"] == highlight_id else ""
+        lines.append(f"{medal} {r['name']} — {r['sold_count']} sold{marker}")
+    return "\n".join(lines)
+
+
+async def agency_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    agency = db.get_agency(update.effective_user.id)
+    if not agency:
+        await update.message.reply_text("This command is for registered agencies only.")
+        return
+    rows = db.get_leaderboard(agency["telegram_id"])
+    if not rows:
+        await update.message.reply_text("No workers yet.", reply_markup=ReplyKeyboardRemove())
+        return
+    await update.message.reply_text(
+        "🏆 Team Leaderboard:\n" + format_leaderboard(rows), reply_markup=ReplyKeyboardRemove()
+    )
+
+
+async def worker_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = await require_worker_access(update)
+    if not worker:
+        return
+    rows = db.get_leaderboard(worker["agency_id"])
+    if not rows:
+        await update.message.reply_text("No leaderboard data yet.", reply_markup=ReplyKeyboardRemove())
+        return
+    await update.message.reply_text(
+        "🏆 Leaderboard:\n" + format_leaderboard(rows, highlight_id=worker["telegram_id"]),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Next Best Action — tells a worker exactly who to contact next, and why
+# ---------------------------------------------------------------------------
+
+async def next_best_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = await require_worker_access(update)
+    if not worker:
+        return
+    worker_id = worker["telegram_id"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    overdue = db.get_overdue_followups(worker_id, today_str)
+    if overdue:
+        top = overdue[0]
+        msg = (
+            f"🎯 Contact next: {top['client_name']} {STATUS_EMOJI.get(top['client_status'], '')}\n"
+            f"Why: their follow-up was due {top['due_date']} — they've been waiting the longest.\n"
+            f"Suggested action: call now, apologize for the delay, and give a clear next step."
+        )
+        client_id_for_button = top["client_id"]
+    else:
+        stalled = db.get_stalled_yellow_clients(worker_id)
+        if stalled:
+            c = stalled[0]
+            msg = (
+                f"🎯 Contact next: {c['name']} 🟡\n"
+                "Why: they're marked 'in progress' but have no follow-up scheduled — "
+                "at risk of going cold.\n"
+                "Suggested action: check in on their decision, then book a concrete next step."
+            )
+            client_id_for_button = c["id"]
+        else:
+            untouched = db.get_untouched_red_clients(worker_id)
+            if untouched:
+                c = untouched[0]
+                msg = (
+                    f"🎯 Contact next: {c['name']} 🔴\n"
+                    "Why: added but never contacted yet — first impressions matter most early.\n"
+                    "Suggested action: make first contact today, introduce yourself and ask what they're looking for."
+                )
+                client_id_for_button = c["id"]
+            else:
+                await update.message.reply_text(
+                    "🎉 You're fully caught up! No urgent priorities right now.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("View this client", callback_data=f"viewclient:{client_id_for_button}")
+    ]])
+    await update.message.reply_text(msg, reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
+# Sales tips — short, practical, shown contextually by client status
+# ---------------------------------------------------------------------------
+
+SALES_TIPS = {
+    "red": [
+        "First contact works best within 24 hours — interest fades fast after that.",
+        "Ask open questions first (budget, timeline, must-haves) before pitching anything.",
+        "A short friendly voice call beats a long text message for a first impression.",
+    ],
+    "yellow": [
+        "Give a specific next step every time you talk — 'I'll call Thursday' beats 'I'll follow up soon'.",
+        "If they've gone quiet, a low-pressure check-in ('just thinking of you, any questions?') often restarts the conversation.",
+        "Share something new each time — a fresh listing, a price update — not just 'checking in'.",
+    ],
+    "green": [
+        "Ask for a referral now, while they're happiest with the deal.",
+        "A short thank-you message after closing goes a long way for future business.",
+    ],
+    "general": [
+        "Log a note right after every call — details fade fast, and it helps you sound prepared next time.",
+        "Prioritize overdue follow-ups first thing each morning, before adding new leads.",
+        "Consistency beats intensity — a client contacted every week beats one contacted intensely then dropped.",
+    ],
+}
+
+
+async def sales_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = await require_worker_access(update)
+    if not worker:
+        return
+    msg = "💡 Sales tips:\n\n"
+    msg += "🔴 New leads:\n" + "\n".join(f"• {t}" for t in SALES_TIPS["red"]) + "\n\n"
+    msg += "🟡 In progress:\n" + "\n".join(f"• {t}" for t in SALES_TIPS["yellow"]) + "\n\n"
+    msg += "🟢 After closing:\n" + "\n".join(f"• {t}" for t in SALES_TIPS["green"]) + "\n\n"
+    msg += "📌 General:\n" + "\n".join(f"• {t}" for t in SALES_TIPS["general"])
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
 
 
 # Owner-only commands
@@ -1268,15 +1413,18 @@ AGENCY_ACTIONS_BY_KEY = {
     "workers": agency_workers,
     "invitelink": agency_invitelink,
     "language": agency_language,
+    "leaderboard": agency_leaderboard,
 }
 AGENCY_QUICK_MENU_LABELS = {
     "en": {
         "addproperty": "📸 Add Property", "properties": "🏠 My Properties", "interests": "❤️ Interests",
         "workers": "🧑‍💼 Workers", "invitelink": "🔗 Invite Link", "language": "🌐 Language",
+        "leaderboard": "🏆 Leaderboard",
     },
     "am": {
         "addproperty": "📸 ንብረት ጨምር", "properties": "🏠 ንብረቶቼ", "interests": "❤️ ፍላጎቶች",
         "workers": "🧑‍💼 ሰራተኞች", "invitelink": "🔗 ሊንክ", "language": "🌐 ቋንቋ",
+        "leaderboard": "🏆 ደረጃ",
     },
 }
 
@@ -1287,15 +1435,20 @@ WORKER_ACTIONS_BY_KEY = {
     "overdue": followups_overdue,
     "language": worker_language_command,
     "help": help_command,
+    "nextaction": next_best_action,
+    "tips": sales_tips,
+    "leaderboard": worker_leaderboard,
 }
 WORKER_QUICK_MENU_LABELS = {
     "en": {
-        "addclient": "➕ Add Client", "clients": "👥 My Clients", "today": "📅 Today", "week": "📆 This Week",
-        "overdue": "⚠️ Overdue", "language": "🌐 Language", "help": "❓ Help",
+        "addclient": "➕ Add Client", "clients": "👥 My Clients", "nextaction": "🎯 Next Best Action",
+        "today": "📅 Today", "week": "📆 This Week", "overdue": "⚠️ Overdue",
+        "leaderboard": "🏆 Leaderboard", "tips": "💡 Sales Tips", "language": "🌐 Language", "help": "❓ Help",
     },
     "am": {
-        "addclient": "➕ ደንበኛ ጨምር", "clients": "👥 ደንበኞቼ", "today": "📅 ዛሬ", "week": "📆 በዚህ ሳምንት",
-        "overdue": "⚠️ ያለፉ", "language": "🌐 ቋንቋ", "help": "❓ እርዳታ",
+        "addclient": "➕ ደንበኛ ጨምር", "clients": "👥 ደንበኞቼ", "nextaction": "🎯 ቀጣይ ተግባር",
+        "today": "📅 ዛሬ", "week": "📆 በዚህ ሳምንት", "overdue": "⚠️ ያለፉ",
+        "leaderboard": "🏆 ደረጃ", "tips": "💡 ምክሮች", "language": "🌐 ቋንቋ", "help": "❓ እርዳታ",
     },
 }
 
@@ -1435,6 +1588,9 @@ def main():
     application.add_handler(CommandHandler("done", followup_done))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("language", worker_language_command))
+    application.add_handler(CommandHandler("nextaction", next_best_action))
+    application.add_handler(CommandHandler("tips", sales_tips))
+    application.add_handler(CommandHandler("leaderboard", worker_leaderboard))
 
     # Agency-only
     application.add_handler(CommandHandler("workers", agency_workers))
@@ -1443,6 +1599,7 @@ def main():
     application.add_handler(CommandHandler("agencylanguage", agency_language))
     application.add_handler(CommandHandler("properties", list_properties))
     application.add_handler(CommandHandler("interests", list_interests))
+    application.add_handler(CommandHandler("agencyleaderboard", agency_leaderboard))
 
     # Owner-only
     application.add_handler(CommandHandler("pending", owner_pending))
